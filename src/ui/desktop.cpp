@@ -66,8 +66,13 @@ Desktop::Desktop(Display* display, Window root, unsigned int width, unsigned int
                           CWOverrideRedirect | CWBackPixel | CWEventMask, &attrs);
   XMapWindow(display_, window_);
   gc_ = XCreateGC(display_, window_, 0, nullptr);
+  label_font_ = XLoadQueryFont(display_, "fixed");
+  compact_label_font_ = XLoadQueryFont(display_, "6x10");
   icon_text_pixel_ = Theme{}.menu_text_pixel;
   icon_shadow_pixel_ = Theme{}.shadow_pixel;
+  if (label_font_) {
+    XSetFont(display_, gc_, label_font_->fid);
+  }
   XSetForeground(display_, gc_, icon_text_pixel_);
   XSetBackground(display_, gc_, background_pixel_);
   backing_ = XCreatePixmap(display_, window_, width_, height_, static_cast<unsigned int>(DefaultDepth(display_, DefaultScreen(display_))));
@@ -77,6 +82,12 @@ Desktop::Desktop(Display* display, Window root, unsigned int width, unsigned int
 Desktop::~Desktop() {
   if (gc_) {
     XFreeGC(display_, gc_);
+  }
+  if (compact_label_font_) {
+    XFreeFont(display_, compact_label_font_);
+  }
+  if (label_font_) {
+    XFreeFont(display_, label_font_);
   }
   if (backing_) {
     XFreePixmap(display_, backing_);
@@ -177,7 +188,12 @@ void Desktop::draw_icon(Drawable target, const DesktopIcon& icon) {
   const int label_top = body_y + body_h + 18;
   const unsigned int tab_w = static_cast<unsigned int>(std::max(8, body_w / 2));
   const unsigned int tab_h = 8;
-  const auto lines = wrap_label(icon.label, 10);
+  const bool compact_label = icon.label == "Applications";
+  const auto lines = wrap_label(icon.label, compact_label ? 14 : 10);
+  XFontStruct* label_font = compact_label && compact_label_font_ ? compact_label_font_ : label_font_;
+  if (label_font) {
+    XSetFont(display_, gc_, label_font->fid);
+  }
 
   if (icon.selected) {
     XSetForeground(display_, gc_, Theme{}.frame_active_pixel);
@@ -199,13 +215,17 @@ void Desktop::draw_icon(Drawable target, const DesktopIcon& icon) {
   XDrawLine(display_, target, gc_, body_x + 8, body_y + 10, body_x + body_w - 8, body_y + 10);
   XDrawLine(display_, target, gc_, body_x + 8, body_y + 22, body_x + body_w - 8, body_y + 22);
   for (std::size_t i = 0; i < lines.size() && i < 2; ++i) {
-    const int text_width = static_cast<int>(lines[i].size()) * 6;
+    const int text_width = label_font ? XTextWidth(label_font, lines[i].c_str(), static_cast<int>(lines[i].size())) : static_cast<int>(lines[i].size()) * 6;
     const int text_x = body_x + std::max(0, (body_w - text_width) / 2);
-    const int text_y = label_top + static_cast<int>(i * 12);
+    const int line_step = compact_label ? 11 : 12;
+    const int text_y = label_top + static_cast<int>(i) * line_step;
     XSetForeground(display_, gc_, icon_shadow_pixel_);
     XDrawString(display_, target, gc_, text_x + 1, text_y + 1, lines[i].c_str(), static_cast<int>(lines[i].size()));
     XSetForeground(display_, gc_, icon_text_pixel_);
     XDrawString(display_, target, gc_, text_x, text_y, lines[i].c_str(), static_cast<int>(lines[i].size()));
+  }
+  if (label_font_) {
+    XSetFont(display_, gc_, label_font_->fid);
   }
 }
 

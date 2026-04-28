@@ -75,6 +75,27 @@ void move_entry_after_label(std::vector<T>& items, const std::string& label, con
   items.insert(items.begin() + static_cast<std::ptrdiff_t>(insert_index), std::move(entry));
 }
 
+template <typename T>
+void move_entry_before_label(std::vector<T>& items, const std::string& label, const std::string& before_label) {
+  const auto entry_it = std::find_if(items.begin(), items.end(), [&](const T& item) {
+    return item.label == label;
+  });
+  const auto before_it = std::find_if(items.begin(), items.end(), [&](const T& item) {
+    return item.label == before_label;
+  });
+  if (entry_it == items.end() || before_it == items.end() || entry_it == before_it) {
+    return;
+  }
+  if (entry_it + 1 == before_it) {
+    return;
+  }
+  T entry = *entry_it;
+  const std::size_t target_index = static_cast<std::size_t>(std::distance(items.begin(), before_it));
+  items.erase(entry_it);
+  const std::size_t insert_index = std::min(target_index, items.size());
+  items.insert(items.begin() + static_cast<std::ptrdiff_t>(insert_index), std::move(entry));
+}
+
 std::string find_in_path(const char* name) {
   const char* path = std::getenv("PATH");
   if (!path || !*path) {
@@ -360,6 +381,7 @@ Config defaults() {
       {"Modern Terminal", modern_terminal_command, 0, 0},
       {"Files", config.file_browser_command, 0, 0},
       {"Home", "chiux:open-home-info", 0, 0},
+      {"Applications", "chiux:open-applications", 0, 0},
       {"Trash", "xdg-open \"$HOME/.local/share/Trash\"", 0, 0},
   };
   return config;
@@ -389,6 +411,7 @@ Config Config::load_or_default(const std::filesystem::path& path) {
 
   config.launchers.clear();
   config.desktop_icons.clear();
+  config.applications.clear();
   bool background_color_specified = false;
   bool resolve_terminal_binary_specified = false;
   bool terminal_command_specified = false;
@@ -457,6 +480,16 @@ Config Config::load_or_default(const std::filesystem::path& path) {
       if (parts.size() >= 4) {
         config.desktop_icons.push_back({parts[0], parts[1], static_cast<int>(parse_uint(parts[2], 0)), static_cast<int>(parse_uint(parts[3], 0))});
       }
+    } else if (key == "application") {
+      auto parts = split(value, '|');
+      if (parts.size() >= 4) {
+        config.applications.push_back({
+            parts[0],
+            parts[1],
+            static_cast<int>(parse_uint(parts[2], 0)),
+            static_cast<int>(parse_uint(parts[3], 0)),
+            parts.size() >= 5 ? parse_uint(parts[4], 0) : 0u});
+      }
     }
   }
 
@@ -502,6 +535,10 @@ Config Config::load_or_default(const std::filesystem::path& path) {
       icon.command = config.file_browser_command;
       config.needs_save = true;
     }
+    if (icon.label == "Applications" && icon.command != "chiux:open-applications") {
+      icon.command = "chiux:open-applications";
+      config.needs_save = true;
+    }
     if (icon.label == "Modern Terminal") {
       const std::string modern_terminal = resolve_modern_terminal();
       if (!modern_terminal.empty() && icon.command != modern_terminal) {
@@ -526,16 +563,29 @@ Config Config::load_or_default(const std::filesystem::path& path) {
   }
   if (config.desktop_icons.empty()) {
     config.desktop_icons = defaults().desktop_icons;
-  } else if (!has_icon_entry(config.desktop_icons, "Modern Terminal")) {
-    const auto terminal_it = std::find_if(config.desktop_icons.begin(), config.desktop_icons.end(), [](const DesktopIcon& icon) {
-      return icon.label == "Terminal";
-    });
-    if (terminal_it != config.desktop_icons.end()) {
-      config.desktop_icons.insert(terminal_it + 1, {"Modern Terminal", resolve_modern_terminal(), 0, 0});
-    } else {
-      config.desktop_icons.push_back({"Modern Terminal", resolve_modern_terminal(), 0, 0});
+  } else {
+    if (!has_icon_entry(config.desktop_icons, "Modern Terminal")) {
+      const auto terminal_it = std::find_if(config.desktop_icons.begin(), config.desktop_icons.end(), [](const DesktopIcon& icon) {
+        return icon.label == "Terminal";
+      });
+      if (terminal_it != config.desktop_icons.end()) {
+        config.desktop_icons.insert(terminal_it + 1, {"Modern Terminal", resolve_modern_terminal(), 0, 0});
+      } else {
+        config.desktop_icons.push_back({"Modern Terminal", resolve_modern_terminal(), 0, 0});
+      }
+      config.needs_save = true;
     }
-    config.needs_save = true;
+    if (!has_icon_entry(config.desktop_icons, "Applications")) {
+      const auto trash_it = std::find_if(config.desktop_icons.begin(), config.desktop_icons.end(), [](const DesktopIcon& icon) {
+        return icon.label == "Trash";
+      });
+      if (trash_it != config.desktop_icons.end()) {
+        config.desktop_icons.insert(trash_it, {"Applications", "chiux:open-applications", 0, 0});
+      } else {
+        config.desktop_icons.push_back({"Applications", "chiux:open-applications", 0, 0});
+      }
+      config.needs_save = true;
+    }
   }
 
   if (!background_color_specified) {
@@ -607,8 +657,12 @@ Config Config::load_or_default(const std::filesystem::path& path) {
   dedupe_preserve_order(config.desktop_icons, [](const DesktopIcon& icon) {
     return icon.label + "\x1f" + icon.command;
   });
+  dedupe_preserve_order(config.applications, [](const ApplicationEntry& entry) {
+    return entry.label + "\x1f" + entry.command;
+  });
   move_entry_after_label(config.launchers, "Modern Terminal", "Terminal");
   move_entry_after_label(config.desktop_icons, "Modern Terminal", "Terminal");
+  move_entry_before_label(config.desktop_icons, "Applications", "Trash");
 
   return config;
 }
@@ -645,6 +699,9 @@ void Config::save(const std::filesystem::path& path) const {
   }
   for (const auto& icon : desktop_icons) {
     output << "icon=" << icon.label << '|' << icon.command << '|' << icon.x << '|' << icon.y << '\n';
+  }
+  for (const auto& entry : applications) {
+    output << "application=" << entry.label << '|' << entry.command << '|' << entry.x << '|' << entry.y << '|' << entry.style << '\n';
   }
 }
 

@@ -20,6 +20,14 @@ struct DesktopIcon {
   int y = 0;
 };
 
+struct ApplicationEntry {
+  std::string label;
+  std::string command;
+  int x = 0;
+  int y = 0;
+  unsigned int style = 0;
+};
+
 struct Config {
   unsigned int border_width = 1;
   unsigned int title_height = 20;
@@ -40,6 +48,7 @@ struct Config {
   std::string file_browser_command = "chiux:open-file-manager";
   std::vector<Launcher> launchers;
   std::vector<DesktopIcon> desktop_icons;
+  std::vector<ApplicationEntry> applications;
   bool needs_save = false;
 
   static Config load_or_default(const std::filesystem::path& path);

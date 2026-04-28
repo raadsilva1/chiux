@@ -1171,6 +1171,8 @@ private:
   }
 
   void resize(unsigned int width, unsigned int height) {
+    const unsigned int previous_cols = cols_;
+    const unsigned int previous_rows = rows_;
     width_ = width;
     height_ = height;
     const unsigned int content_height = height_ > chrome_height_ ? height_ - chrome_height_ : 1u;
@@ -1191,6 +1193,9 @@ private:
     scrollback_offset_ = 0;
     cursor_x_ = std::min(cursor_x_, static_cast<int>(cols_ - 1));
     cursor_y_ = std::min(cursor_y_, static_cast<int>(rows_ - 1));
+    if (alternate_screen_state_.active) {
+      resize_saved_main_screen(previous_cols, previous_rows);
+    }
     reset_scroll_region();
     recreate_backing();
     notify_child_winsize();
@@ -1220,9 +1225,6 @@ private:
     ws.ws_xpixel = static_cast<unsigned short>(width_);
     ws.ws_ypixel = static_cast<unsigned short>(height_ > chrome_height_ ? height_ - chrome_height_ : height_);
     ioctl(master_fd_, TIOCSWINSZ, &ws);
-    if (child_pid_ > 0) {
-      kill(child_pid_, SIGWINCH);
-    }
   }
 
   void spawn_shell() {
@@ -1245,12 +1247,21 @@ private:
       throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
     }
     if (pid == 0) {
+      if (master_fd_ >= 0) {
+        close(master_fd_);
+      }
       setsid();
       const int slave_fd = open(slave_name.data(), O_RDWR);
       if (slave_fd < 0) {
         _exit(127);
       }
       ioctl(slave_fd, TIOCSCTTY, 0);
+      winsize ws{};
+      ws.ws_col = static_cast<unsigned short>(cols_);
+      ws.ws_row = static_cast<unsigned short>(rows_);
+      ws.ws_xpixel = static_cast<unsigned short>(width_);
+      ws.ws_ypixel = static_cast<unsigned short>(height_ > chrome_height_ ? height_ - chrome_height_ : height_);
+      ioctl(slave_fd, TIOCSWINSZ, &ws);
       dup2(slave_fd, STDIN_FILENO);
       dup2(slave_fd, STDOUT_FILENO);
       dup2(slave_fd, STDERR_FILENO);
@@ -1297,12 +1308,18 @@ private:
       return false;
     }
     if (pid > 0) {
+      child_pid_ = -1;
+      if (should_respawn_interactive_shell(status)) {
+        respawn_interactive_shell();
+        return false;
+      }
       running_ = false;
       return true;
     }
     if (errno != ECHILD) {
       chiux::log::warn(std::string("chiux-te-2 waitpid failed: ") + std::strerror(errno));
     }
+    child_pid_ = -1;
     running_ = false;
     return true;
   }
@@ -1338,10 +1355,37 @@ private:
         continue;
       }
       if (n == 0) {
-        running_ = false;
+        break;
       }
       break;
     }
+  }
+
+  bool should_respawn_interactive_shell(int status) const {
+    if (!exec_command_.empty()) {
+      return false;
+    }
+    if (WIFSIGNALED(status)) {
+      return true;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) != 0;
+  }
+
+  void respawn_interactive_shell() {
+    if (master_fd_ >= 0) {
+      close(master_fd_);
+      master_fd_ = -1;
+    }
+    history_rows_.clear();
+    scrollback_offset_ = 0;
+    alternate_screen_active_ = false;
+    alternate_screen_state_ = AlternateScreenState{};
+    clear_completion_state();
+    editor_.text.clear();
+    editor_.cursor = 0;
+    reset_screen();
+    spawn_shell();
+    redraw();
   }
 
   void process_byte(unsigned char ch) {
@@ -1922,6 +1966,8 @@ private:
       alternate_screen_state_.current_hyperlink_uri = current_hyperlink_uri_;
       alternate_screen_state_.keyboard_flags = keyboard_flags_;
       alternate_screen_state_.keyboard_mode_stack = keyboard_mode_stack_;
+      alternate_screen_state_.cols = cols_;
+      alternate_screen_state_.rows = rows_;
       alternate_screen_state_.scroll_region_top = scroll_region_top_;
       alternate_screen_state_.scroll_region_bottom = scroll_region_bottom_;
       alternate_screen_state_.origin_mode = origin_mode_;
@@ -1940,7 +1986,18 @@ private:
       cursor_y_ = 0;
       reset_scroll_region();
     } else if (alternate_screen_state_.active) {
-      cells_ = alternate_screen_state_.cells;
+      std::vector<Cell> restored(static_cast<std::size_t>(cols_ * rows_));
+      if (alternate_screen_state_.cols > 0 && alternate_screen_state_.rows > 0 && !alternate_screen_state_.cells.empty()) {
+        const unsigned int copy_cols = std::min(cols_, alternate_screen_state_.cols);
+        const unsigned int copy_rows = std::min(rows_, alternate_screen_state_.rows);
+        for (unsigned int row = 0; row < copy_rows; ++row) {
+          for (unsigned int col = 0; col < copy_cols; ++col) {
+            restored[static_cast<std::size_t>(row) * cols_ + col] =
+                alternate_screen_state_.cells[static_cast<std::size_t>(row) * alternate_screen_state_.cols + col];
+          }
+        }
+      }
+      cells_.swap(restored);
       cursor_x_ = alternate_screen_state_.cursor_x;
       cursor_y_ = alternate_screen_state_.cursor_y;
       current_fg_pixel_ = alternate_screen_state_.current_fg_pixel;
@@ -2176,6 +2233,31 @@ private:
     for (unsigned int row = static_cast<unsigned int>(std::max(0, cursor_y_ + 1)); row <= static_cast<unsigned int>(scroll_region_bottom_); ++row) {
       clear_row(row);
     }
+  }
+
+  void resize_saved_main_screen(unsigned int old_cols, unsigned int old_rows) {
+    if (!alternate_screen_state_.active) {
+      return;
+    }
+    std::vector<Cell> resized(static_cast<std::size_t>(cols_ * rows_));
+    if (old_cols > 0 && old_rows > 0 && !alternate_screen_state_.cells.empty()) {
+      const unsigned int copy_cols = std::min(cols_, old_cols);
+      const unsigned int copy_rows = std::min(rows_, old_rows);
+      for (unsigned int row = 0; row < copy_rows; ++row) {
+        for (unsigned int col = 0; col < copy_cols; ++col) {
+          resized[static_cast<std::size_t>(row) * cols_ + col] =
+              alternate_screen_state_.cells[static_cast<std::size_t>(row) * old_cols + col];
+        }
+      }
+    }
+    alternate_screen_state_.cells.swap(resized);
+    alternate_screen_state_.cols = cols_;
+    alternate_screen_state_.rows = rows_;
+    alternate_screen_state_.cursor_x = std::clamp(alternate_screen_state_.cursor_x, 0, static_cast<int>(cols_) - 1);
+    alternate_screen_state_.cursor_y = std::clamp(alternate_screen_state_.cursor_y, 0, static_cast<int>(rows_) - 1);
+    alternate_screen_state_.scroll_region_top = 0;
+    alternate_screen_state_.scroll_region_bottom = static_cast<int>(rows_ ? rows_ - 1 : 0);
+    alternate_screen_state_.origin_mode = false;
   }
 
   void reset_scroll_region() {
@@ -4050,6 +4132,8 @@ private:
   struct AlternateScreenState {
     bool active = false;
     std::vector<Cell> cells;
+    unsigned int cols = 0;
+    unsigned int rows = 0;
     std::deque<std::vector<Cell>> history_rows;
     std::size_t scrollback_offset = 0;
     int cursor_x = 0;

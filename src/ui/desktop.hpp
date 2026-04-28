@@ -51,6 +51,8 @@ private:
   unsigned long icon_text_pixel_ = 0;
   unsigned long icon_shadow_pixel_ = 0;
   GC gc_ = nullptr;
+  XFontStruct* label_font_ = nullptr;
+  XFontStruct* compact_label_font_ = nullptr;
   Pixmap backing_ = 0;
   std::vector<DesktopIcon> icons_;
   std::optional<std::size_t> selected_icon_;

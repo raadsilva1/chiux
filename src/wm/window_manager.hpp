@@ -57,6 +57,7 @@ private:
   void cycle_desktop(int delta);
   void open_execute_window();
   void open_file_manager_window();
+  void open_applications_window();
   void open_preferences_window();
   void open_about_window();
   void open_home_window();
@@ -68,6 +69,7 @@ private:
   void present_internal_content(Client& client);
   void draw_execute_window(Client& client);
   void draw_file_manager_window(Client& client);
+  void draw_applications_window(Client& client);
   void draw_preferences_window(Client& client);
   void draw_about_window(Client& client);
   void draw_home_window(Client& client);
@@ -130,6 +132,14 @@ private:
   void set_active_window(Window window);
   void reap_children();
   void handle_idle();
+  std::optional<std::size_t> hit_test_application_icon(const Client& client, int x, int y) const;
+  void persist_applications();
+  void add_application_entry();
+  void update_selected_application();
+  void remove_selected_application();
+  void clear_application_form(bool clear_selection);
+  void load_selected_application_into_form();
+  void cycle_application_style(int delta);
 
   x11::Connection& connection_;
   config::Config config_;
@@ -160,6 +170,7 @@ private:
   std::array<std::string, kDesktopCount> desktop_names_{{"Desktop 1", "Desktop 2", "Desktop 3", "Desktop 4"}};
   Window execute_window_ = 0;
   Window file_manager_window_ = 0;
+  Window applications_window_ = 0;
   Window preferences_window_ = 0;
   Window about_window_ = 0;
   Window home_window_ = 0;
@@ -168,6 +179,9 @@ private:
   std::size_t file_manager_selected_ = 0;
   std::size_t file_manager_scroll_ = 0;
   std::string execute_buffer_;
+  std::string application_name_buffer_;
+  std::string application_command_buffer_;
+  unsigned int application_style_index_ = 0;
   std::unordered_map<Window, Client> clients_;
   std::vector<Window> stacking_order_;
   std::unique_ptr<ui::PopupMenu> popup_menu_;
@@ -190,6 +204,16 @@ private:
   int drag_icon_offset_y_ = 0;
   int drag_icon_start_x_ = 0;
   int drag_icon_start_y_ = 0;
+  enum class ApplicationsField { Name, Command };
+  ApplicationsField applications_active_field_ = ApplicationsField::Name;
+  bool applications_details_collapsed_ = true;
+  std::optional<std::size_t> applications_selected_;
+  std::optional<std::size_t> applications_drag_index_;
+  bool applications_drag_moved_ = false;
+  int applications_drag_offset_x_ = 0;
+  int applications_drag_offset_y_ = 0;
+  int applications_drag_start_x_ = 0;
+  int applications_drag_start_y_ = 0;
   unsigned int next_icon_order_ = 0;
   std::vector<PreferenceSwatch> preferences_palette_;
   unsigned long icon_text_pixel_ = 0x000000;

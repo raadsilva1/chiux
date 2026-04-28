@@ -865,6 +865,8 @@ private:
   }
 
   void resize(unsigned int width, unsigned int height) {
+    const unsigned int previous_cols = cols_;
+    const unsigned int previous_rows = rows_;
     width_ = width;
     height_ = height;
     const unsigned int content_height = height_ > chrome_height_ ? height_ - chrome_height_ : 1u;
@@ -885,6 +887,10 @@ private:
     scrollback_offset_ = 0;
     cursor_x_ = std::min(cursor_x_, static_cast<int>(cols_ - 1));
     cursor_y_ = std::min(cursor_y_, static_cast<int>(rows_ - 1));
+    if (alternate_screen_state_.active) {
+      resize_saved_main_screen(previous_cols, previous_rows);
+    }
+    reset_scroll_region();
     recreate_backing();
     notify_child_winsize();
     redraw();
@@ -908,9 +914,6 @@ private:
     ws.ws_xpixel = static_cast<unsigned short>(width_);
     ws.ws_ypixel = static_cast<unsigned short>(height_ > chrome_height_ ? height_ - chrome_height_ : height_);
     ioctl(master_fd_, TIOCSWINSZ, &ws);
-    if (child_pid_ > 0) {
-      kill(child_pid_, SIGWINCH);
-    }
   }
 
   void spawn_shell() {
@@ -933,12 +936,21 @@ private:
       throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
     }
     if (pid == 0) {
+      if (master_fd_ >= 0) {
+        close(master_fd_);
+      }
       setsid();
       const int slave_fd = open(slave_name.data(), O_RDWR);
       if (slave_fd < 0) {
         _exit(127);
       }
       ioctl(slave_fd, TIOCSCTTY, 0);
+      winsize ws{};
+      ws.ws_col = static_cast<unsigned short>(cols_);
+      ws.ws_row = static_cast<unsigned short>(rows_);
+      ws.ws_xpixel = static_cast<unsigned short>(width_);
+      ws.ws_ypixel = static_cast<unsigned short>(height_ > chrome_height_ ? height_ - chrome_height_ : height_);
+      ioctl(slave_fd, TIOCSWINSZ, &ws);
       dup2(slave_fd, STDIN_FILENO);
       dup2(slave_fd, STDOUT_FILENO);
       dup2(slave_fd, STDERR_FILENO);
@@ -961,6 +973,7 @@ private:
     if (flags >= 0) {
       fcntl(master_fd_, F_SETFL, flags | O_NONBLOCK);
     }
+    notify_child_winsize();
   }
 
   void terminate_child() {
@@ -983,12 +996,18 @@ private:
       return false;
     }
     if (pid > 0) {
+      child_pid_ = -1;
+      if (should_respawn_interactive_shell(status)) {
+        respawn_interactive_shell();
+        return false;
+      }
       running_ = false;
       return true;
     }
     if (errno != ECHILD) {
       chiux::log::warn(std::string("chiux-te waitpid failed: ") + std::strerror(errno));
     }
+    child_pid_ = -1;
     running_ = false;
     return true;
   }
@@ -1024,10 +1043,37 @@ private:
         continue;
       }
       if (n == 0) {
-        running_ = false;
+        break;
       }
       break;
     }
+  }
+
+  bool should_respawn_interactive_shell(int status) const {
+    if (!exec_command_.empty()) {
+      return false;
+    }
+    if (WIFSIGNALED(status)) {
+      return true;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) != 0;
+  }
+
+  void respawn_interactive_shell() {
+    if (master_fd_ >= 0) {
+      close(master_fd_);
+      master_fd_ = -1;
+    }
+    history_rows_.clear();
+    scrollback_offset_ = 0;
+    alternate_screen_active_ = false;
+    alternate_screen_state_ = AlternateScreenState{};
+    clear_completion_state();
+    editor_.text.clear();
+    editor_.cursor = 0;
+    reset_screen();
+    spawn_shell();
+    redraw();
   }
 
   void process_byte(unsigned char ch) {
@@ -1061,6 +1107,12 @@ private:
           csi_current_ = 0;
           csi_have_value_ = false;
           csi_private_ = false;
+        } else if (ch == '=') {
+          application_keypad_mode_ = true;
+          state_ = ParseState::Ground;
+        } else if (ch == '>') {
+          application_keypad_mode_ = false;
+          state_ = ParseState::Ground;
         } else if (ch == '(') {
           state_ = ParseState::Charset;
           charset_target_g1_ = false;
@@ -1158,6 +1210,10 @@ private:
         const int value = raw < 0 ? 0 : raw;
         if (value == 47 || value == 1047 || value == 1049) {
           set_alternate_screen(enable);
+        } else if (value == 1) {
+          application_cursor_keys_ = enable;
+        } else if (value == 6) {
+          origin_mode_ = enable;
         } else if (value == 2004) {
           bracketed_paste_mode_ = enable;
         } else if (value == 1000) {
@@ -1181,10 +1237,10 @@ private:
 
     switch (final) {
       case 'A':
-        cursor_y_ = std::max(0, cursor_y_ - param_or(0, 1));
+        cursor_y_ = clamp_cursor_row(cursor_y_ - param_or(0, 1));
         break;
       case 'B':
-        cursor_y_ = std::min(static_cast<int>(rows_) - 1, cursor_y_ + param_or(0, 1));
+        cursor_y_ = clamp_cursor_row(cursor_y_ + param_or(0, 1));
         break;
       case 'C':
         cursor_x_ = std::min(static_cast<int>(cols_) - 1, cursor_x_ + param_or(0, 1));
@@ -1194,8 +1250,17 @@ private:
         break;
       case 'H':
       case 'f':
-        cursor_y_ = std::clamp(param_or(0, 1) - 1, 0, static_cast<int>(rows_) - 1);
+        cursor_y_ = clamp_cursor_row(param_or(0, 1) - 1);
         cursor_x_ = std::clamp(param_or(1, 1) - 1, 0, static_cast<int>(cols_) - 1);
+        break;
+      case 'd':
+        cursor_y_ = clamp_cursor_row(param_or(0, 1) - 1);
+        break;
+      case 'a':
+        cursor_x_ = std::min(static_cast<int>(cols_) - 1, cursor_x_ + param_or(0, 1));
+        break;
+      case 'e':
+        cursor_y_ = clamp_cursor_row(cursor_y_ + param_or(0, 1));
         break;
       case 'J': {
         const int mode = param_or(0, 0);
@@ -1217,6 +1282,33 @@ private:
       }
       case 'G':
         cursor_x_ = std::clamp(param_or(0, 1) - 1, 0, static_cast<int>(cols_) - 1);
+        break;
+      case 'r': {
+        const int top = param_or(0, 1) - 1;
+        const int bottom = param_or(1, static_cast<int>(rows_)) - 1;
+        set_scroll_region(top, bottom);
+        break;
+      }
+      case 'L':
+        insert_lines(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'M':
+        delete_lines(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'P':
+        delete_chars(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case '@':
+        insert_chars(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'X':
+        erase_chars(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'S':
+        scroll_region_up(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'T':
+        scroll_region_down(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
         break;
       case 'm':
         apply_sgr();
@@ -1341,6 +1433,9 @@ private:
       return;
     }
     if (enable) {
+      clear_completion_state();
+      editor_.text.clear();
+      editor_.cursor = 0;
       alternate_screen_state_.cells = cells_;
       alternate_screen_state_.cursor_x = cursor_x_;
       alternate_screen_state_.cursor_y = cursor_y_;
@@ -1348,6 +1443,11 @@ private:
       alternate_screen_state_.current_bg_pixel = current_bg_pixel_;
       alternate_screen_state_.current_bold = current_bold_;
       alternate_screen_state_.current_inverse = current_inverse_;
+      alternate_screen_state_.cols = cols_;
+      alternate_screen_state_.rows = rows_;
+      alternate_screen_state_.scroll_region_top = scroll_region_top_;
+      alternate_screen_state_.scroll_region_bottom = scroll_region_bottom_;
+      alternate_screen_state_.origin_mode = origin_mode_;
       alternate_screen_state_.history_rows = history_rows_;
       alternate_screen_state_.scrollback_offset = scrollback_offset_;
       alternate_screen_state_.g0_special_graphics = g0_special_graphics_;
@@ -1361,20 +1461,38 @@ private:
       }
       cursor_x_ = 0;
       cursor_y_ = 0;
+      reset_scroll_region();
     } else if (alternate_screen_state_.active) {
-      cells_ = alternate_screen_state_.cells;
+      std::vector<Cell> restored(static_cast<std::size_t>(cols_ * rows_));
+      if (alternate_screen_state_.cols > 0 && alternate_screen_state_.rows > 0 && !alternate_screen_state_.cells.empty()) {
+        const unsigned int copy_cols = std::min(cols_, alternate_screen_state_.cols);
+        const unsigned int copy_rows = std::min(rows_, alternate_screen_state_.rows);
+        for (unsigned int row = 0; row < copy_rows; ++row) {
+          for (unsigned int col = 0; col < copy_cols; ++col) {
+            restored[static_cast<std::size_t>(row) * cols_ + col] =
+                alternate_screen_state_.cells[static_cast<std::size_t>(row) * alternate_screen_state_.cols + col];
+          }
+        }
+      }
+      cells_.swap(restored);
       cursor_x_ = alternate_screen_state_.cursor_x;
       cursor_y_ = alternate_screen_state_.cursor_y;
       current_fg_pixel_ = alternate_screen_state_.current_fg_pixel;
       current_bg_pixel_ = alternate_screen_state_.current_bg_pixel;
       current_bold_ = alternate_screen_state_.current_bold;
       current_inverse_ = alternate_screen_state_.current_inverse;
+      scroll_region_top_ = alternate_screen_state_.scroll_region_top;
+      scroll_region_bottom_ = alternate_screen_state_.scroll_region_bottom;
+      origin_mode_ = alternate_screen_state_.origin_mode;
       history_rows_ = alternate_screen_state_.history_rows;
       scrollback_offset_ = alternate_screen_state_.scrollback_offset;
       g0_special_graphics_ = alternate_screen_state_.g0_special_graphics;
       g1_special_graphics_ = alternate_screen_state_.g1_special_graphics;
       use_g1_charset_ = alternate_screen_state_.use_g1_charset;
       alternate_screen_state_.active = false;
+      clear_completion_state();
+      editor_.text.clear();
+      editor_.cursor = 0;
     }
     alternate_screen_active_ = enable;
     redraw();
@@ -1505,18 +1623,20 @@ private:
   }
 
   void line_feed() {
-    ++cursor_y_;
-    if (cursor_y_ >= static_cast<int>(rows_)) {
-      scroll_up();
-      cursor_y_ = static_cast<int>(rows_) - 1;
+    if (cursor_y_ < scroll_region_bottom_) {
+      ++cursor_y_;
+    } else {
+      scroll_region_up(1);
+      cursor_y_ = scroll_region_bottom_;
     }
   }
 
   void reverse_index() {
-    if (cursor_y_ == 0) {
-      scroll_down();
-    } else {
+    if (cursor_y_ > scroll_region_top_) {
       --cursor_y_;
+    } else {
+      scroll_region_down(1);
+      cursor_y_ = scroll_region_top_;
     }
   }
 
@@ -1579,8 +1699,205 @@ private:
 
   void clear_from_cursor() {
     clear_line_from_cursor();
-    for (unsigned int row = static_cast<unsigned int>(std::max(0, cursor_y_ + 1)); row < rows_; ++row) {
+    for (unsigned int row = static_cast<unsigned int>(std::max(0, cursor_y_ + 1)); row <= static_cast<unsigned int>(scroll_region_bottom_); ++row) {
       clear_row(row);
+    }
+  }
+
+  void resize_saved_main_screen(unsigned int old_cols, unsigned int old_rows) {
+    if (!alternate_screen_state_.active) {
+      return;
+    }
+    std::vector<Cell> resized(static_cast<std::size_t>(cols_ * rows_));
+    if (old_cols > 0 && old_rows > 0 && !alternate_screen_state_.cells.empty()) {
+      const unsigned int copy_cols = std::min(cols_, old_cols);
+      const unsigned int copy_rows = std::min(rows_, old_rows);
+      for (unsigned int row = 0; row < copy_rows; ++row) {
+        for (unsigned int col = 0; col < copy_cols; ++col) {
+          resized[static_cast<std::size_t>(row) * cols_ + col] =
+              alternate_screen_state_.cells[static_cast<std::size_t>(row) * old_cols + col];
+        }
+      }
+    }
+    alternate_screen_state_.cells.swap(resized);
+    alternate_screen_state_.cols = cols_;
+    alternate_screen_state_.rows = rows_;
+    alternate_screen_state_.cursor_x = std::clamp(alternate_screen_state_.cursor_x, 0, static_cast<int>(cols_) - 1);
+    alternate_screen_state_.cursor_y = std::clamp(alternate_screen_state_.cursor_y, 0, static_cast<int>(rows_) - 1);
+    alternate_screen_state_.scroll_region_top = 0;
+    alternate_screen_state_.scroll_region_bottom = static_cast<int>(rows_ ? rows_ - 1 : 0);
+    alternate_screen_state_.origin_mode = false;
+  }
+
+  void reset_scroll_region() {
+    scroll_region_top_ = 0;
+    scroll_region_bottom_ = static_cast<int>(rows_ ? rows_ - 1 : 0);
+    origin_mode_ = false;
+  }
+
+  int clamp_cursor_row(int row) const {
+    if (origin_mode_) {
+      const int top = scroll_region_top_;
+      const int bottom = scroll_region_bottom_;
+      return std::clamp(top + row, top, bottom);
+    }
+    return std::clamp(row, 0, static_cast<int>(rows_) - 1);
+  }
+
+  void set_scroll_region(int top, int bottom) {
+    if (rows_ == 0) {
+      return;
+    }
+    const int max_row = static_cast<int>(rows_) - 1;
+    if (top < 0) {
+      top = 0;
+    }
+    if (bottom < 0 || bottom > max_row) {
+      bottom = max_row;
+    }
+    if (top >= bottom) {
+      reset_scroll_region();
+      return;
+    }
+    scroll_region_top_ = top;
+    scroll_region_bottom_ = bottom;
+    if (cursor_y_ < scroll_region_top_ || cursor_y_ > scroll_region_bottom_) {
+      cursor_y_ = scroll_region_top_;
+    }
+    cursor_x_ = std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1);
+  }
+
+  void scroll_region_up(unsigned int lines) {
+    if (rows_ == 0 || cols_ == 0 || lines == 0) {
+      return;
+    }
+    const unsigned int top = static_cast<unsigned int>(std::clamp(scroll_region_top_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int bottom = static_cast<unsigned int>(std::clamp(scroll_region_bottom_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int region_height = bottom >= top ? bottom - top + 1u : 0u;
+    if (region_height == 0) {
+      return;
+    }
+    const unsigned int amount = std::min(lines, region_height);
+    if (top == 0 && bottom + 1u == rows_) {
+      history_rows_.push_back(snapshot_row(0));
+      if (history_rows_.size() > history_limit_) {
+        history_rows_.pop_front();
+      }
+      if (scrollback_offset_ > 0) {
+        ++scrollback_offset_;
+      }
+    }
+    for (unsigned int line = 0; line < amount; ++line) {
+      for (unsigned int row = top; row < bottom; ++row) {
+        for (unsigned int col = 0; col < cols_; ++col) {
+          cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row + 1) * cols_ + col];
+        }
+      }
+      clear_row(bottom);
+    }
+  }
+
+  void scroll_region_down(unsigned int lines) {
+    if (rows_ == 0 || cols_ == 0 || lines == 0) {
+      return;
+    }
+    const unsigned int top = static_cast<unsigned int>(std::clamp(scroll_region_top_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int bottom = static_cast<unsigned int>(std::clamp(scroll_region_bottom_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int region_height = bottom >= top ? bottom - top + 1u : 0u;
+    if (region_height == 0) {
+      return;
+    }
+    const unsigned int amount = std::min(lines, region_height);
+    for (unsigned int line = 0; line < amount; ++line) {
+      for (unsigned int row = bottom; row > top; --row) {
+        for (unsigned int col = 0; col < cols_; ++col) {
+          cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row - 1) * cols_ + col];
+        }
+      }
+      clear_row(top);
+    }
+  }
+
+  void insert_lines(unsigned int lines) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < scroll_region_top_ || cursor_y_ > scroll_region_bottom_) {
+      return;
+    }
+    const unsigned int top = static_cast<unsigned int>(cursor_y_);
+    const unsigned int bottom = static_cast<unsigned int>(std::clamp(scroll_region_bottom_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int amount = std::min(lines, bottom - top + 1u);
+    for (unsigned int line = 0; line < amount; ++line) {
+      for (unsigned int row = bottom; row > top; --row) {
+        for (unsigned int col = 0; col < cols_; ++col) {
+          cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row - 1) * cols_ + col];
+        }
+      }
+      clear_row(top);
+    }
+  }
+
+  void delete_lines(unsigned int lines) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < scroll_region_top_ || cursor_y_ > scroll_region_bottom_) {
+      return;
+    }
+    const unsigned int top = static_cast<unsigned int>(cursor_y_);
+    const unsigned int bottom = static_cast<unsigned int>(std::clamp(scroll_region_bottom_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int amount = std::min(lines, bottom - top + 1u);
+    for (unsigned int line = 0; line < amount; ++line) {
+      for (unsigned int row = top; row < bottom; ++row) {
+        for (unsigned int col = 0; col < cols_; ++col) {
+          cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row + 1) * cols_ + col];
+        }
+      }
+      clear_row(bottom);
+    }
+  }
+
+  void insert_chars(unsigned int chars) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < 0 || cursor_y_ >= static_cast<int>(rows_)) {
+      return;
+    }
+    const unsigned int row = static_cast<unsigned int>(cursor_y_);
+    const unsigned int start = static_cast<unsigned int>(std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1));
+    const unsigned int amount = std::min(chars, cols_ - start);
+    if (amount == 0) {
+      return;
+    }
+    for (int col = static_cast<int>(cols_) - 1; col >= static_cast<int>(start + amount); --col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + static_cast<std::size_t>(col)] =
+          cells_[static_cast<std::size_t>(row) * cols_ + static_cast<std::size_t>(col - static_cast<int>(amount))];
+    }
+    for (unsigned int col = 0; col < amount; ++col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + start + col] = Cell{};
+    }
+  }
+
+  void delete_chars(unsigned int chars) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < 0 || cursor_y_ >= static_cast<int>(rows_)) {
+      return;
+    }
+    const unsigned int row = static_cast<unsigned int>(cursor_y_);
+    const unsigned int start = static_cast<unsigned int>(std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1));
+    const unsigned int amount = std::min(chars, cols_ - start);
+    if (amount == 0) {
+      return;
+    }
+    for (unsigned int col = start; col + amount < cols_; ++col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row) * cols_ + col + amount];
+    }
+    for (unsigned int col = cols_ - amount; col < cols_; ++col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + col] = Cell{};
+    }
+  }
+
+  void erase_chars(unsigned int chars) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < 0 || cursor_y_ >= static_cast<int>(rows_)) {
+      return;
+    }
+    const unsigned int row = static_cast<unsigned int>(cursor_y_);
+    const unsigned int start = static_cast<unsigned int>(std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1));
+    const unsigned int amount = std::min(chars, cols_ - start);
+    for (unsigned int col = 0; col < amount; ++col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + start + col] = Cell{};
     }
   }
 
@@ -2032,10 +2349,10 @@ private:
     const int title_x = std::max(64, static_cast<int>(width_) - title_width - 10);
 
     std::string status_text;
-    if (completion_popup_open_ && !completion_items_.empty()) {
+    if (!alternate_screen_active_ && completion_popup_open_ && !completion_items_.empty()) {
       const auto& item = completion_items_[completion_index_ % completion_items_.size()];
       status_text = "Tab: " + item.label;
-    } else if (!history_hint_.empty()) {
+    } else if (!alternate_screen_active_ && !history_hint_.empty()) {
       status_text = "Hist: " + history_hint_;
     }
     if (!status_text.empty()) {
@@ -2400,19 +2717,20 @@ private:
     KeySym sym = NoSymbol;
     char buffer[64] = {};
     const int length = XLookupString(const_cast<XKeyEvent*>(&event), buffer, sizeof(buffer), &sym, nullptr);
+    const bool tui_mode = alternate_screen_active_;
 
     if (scrollback_offset_ != 0) {
       scrollback_offset_ = 0;
       redraw();
     }
 
-    if (completion_popup_open_ && sym == XK_Escape) {
+    if (!tui_mode && completion_popup_open_ && sym == XK_Escape) {
       clear_completion_state();
       redraw();
       return;
     }
 
-    if (completion_popup_open_ && sym == XK_Tab) {
+    if (!tui_mode && completion_popup_open_ && sym == XK_Tab) {
       if (!completion_items_.empty()) {
         completion_index_ = (completion_index_ + 1) % completion_items_.size();
         redraw();
@@ -2420,7 +2738,7 @@ private:
       }
     }
 
-    if (completion_popup_open_ && (sym == XK_Return || sym == XK_KP_Enter)) {
+    if (!tui_mode && completion_popup_open_ && (sym == XK_Return || sym == XK_KP_Enter)) {
       accept_completion();
       commit_current_line_history();
       send_bytes("\r", 1);
@@ -2450,6 +2768,10 @@ private:
     }
 
     if ((event.state & ControlMask) != 0 && (event.state & ShiftMask) == 0) {
+      if (tui_mode && length > 0) {
+        send_bytes(buffer, static_cast<std::size_t>(length));
+        return;
+      }
       switch (sym) {
         case XK_A:
         case XK_a:
@@ -2504,22 +2826,49 @@ private:
       send_bytes(&ch, 1);
     };
 
-    if ((event.state & Mod1Mask) != 0 && length > 0) {
+    auto send_cursor_sequence = [&](const char* normal, const char* application) {
+      const bool application_mode = tui_mode || application_cursor_keys_ || application_keypad_mode_;
+      const char* seq = application_mode ? application : normal;
+      send_bytes(seq, std::strlen(seq));
+    };
+
+    const bool special_keysym =
+        sym == XK_Return || sym == XK_KP_Enter ||
+        sym == XK_BackSpace || sym == XK_Tab || sym == XK_Escape ||
+        sym == XK_Left || sym == XK_KP_Left ||
+        sym == XK_Right || sym == XK_KP_Right ||
+        sym == XK_Up || sym == XK_KP_Up ||
+        sym == XK_Down || sym == XK_KP_Down ||
+        sym == XK_Home || sym == XK_KP_Home ||
+        sym == XK_End || sym == XK_KP_End ||
+        sym == XK_Delete || sym == XK_KP_Delete ||
+        sym == XK_Page_Up || sym == XK_KP_Page_Up ||
+        sym == XK_Page_Down || sym == XK_KP_Page_Down;
+
+    if ((event.state & Mod1Mask) != 0 && length > 0 && !special_keysym) {
       send_char('\x1b');
       send_bytes(buffer, static_cast<std::size_t>(length));
-      clear_completion_state();
-      redraw();
+      if (!tui_mode) {
+        clear_completion_state();
+        redraw();
+      }
       return;
     }
 
-    if ((event.state & ControlMask) != 0 && length > 0) {
+    if ((event.state & ControlMask) != 0 && length > 0 && !special_keysym) {
       send_bytes(buffer, static_cast<std::size_t>(length));
-      clear_completion_state();
-      redraw();
+      if (!tui_mode) {
+        clear_completion_state();
+        redraw();
+      }
       return;
     }
 
-    if (length > 0) {
+    if (length > 0 && !special_keysym) {
+      if (tui_mode) {
+        send_bytes(buffer, static_cast<std::size_t>(length));
+        return;
+      }
       insert_text_at_cursor(std::string(buffer, static_cast<std::size_t>(length)));
       return;
     }
@@ -2527,17 +2876,33 @@ private:
     switch (sym) {
       case XK_Return:
       case XK_KP_Enter:
-        commit_current_line_history();
-        send_char('\r');
-        editor_.text.clear();
-        editor_.cursor = 0;
-        clear_completion_state();
+        if (!tui_mode) {
+          commit_current_line_history();
+        }
+        if (application_keypad_mode_ && sym == XK_KP_Enter) {
+          send_bytes("\x1bOM", 3);
+        } else {
+          send_char('\r');
+        }
+        if (!tui_mode) {
+          editor_.text.clear();
+          editor_.cursor = 0;
+          clear_completion_state();
+        }
         break;
       case XK_BackSpace:
-        erase_previous_character();
+        if (tui_mode) {
+          send_bytes("\b", 1);
+        } else {
+          erase_previous_character();
+        }
         break;
       case XK_Tab:
         {
+          if (tui_mode) {
+            send_char('\t');
+            break;
+          }
           const bool was_open = completion_popup_open_;
         refresh_completion_state();
         if (completion_popup_open_ && !completion_items_.empty()) {
@@ -2552,45 +2917,122 @@ private:
         break;
       case XK_Escape:
         send_char('\x1b');
-        clear_completion_state();
+        if (!tui_mode) {
+          clear_completion_state();
+        }
         break;
       case XK_Left:
-        move_cursor_left();
+        if (!tui_mode) {
+          move_cursor_left();
+        }
+        send_cursor_sequence("\x1b[D", "\x1bOD");
+        break;
+      case XK_KP_Left:
+        if (!tui_mode) {
+          move_cursor_left();
+        }
+        send_cursor_sequence("\x1b[D", "\x1bOD");
         break;
       case XK_Right:
-        move_cursor_right();
+        if (!tui_mode) {
+          move_cursor_right();
+        }
+        send_cursor_sequence("\x1b[C", "\x1bOC");
+        break;
+      case XK_KP_Right:
+        if (!tui_mode) {
+          move_cursor_right();
+        }
+        send_cursor_sequence("\x1b[C", "\x1bOC");
         break;
       case XK_Up:
-        clear_completion_state();
-        editor_.text.clear();
-        editor_.cursor = 0;
-        send_bytes("\x1b[A", 3);
+        if (!tui_mode) {
+          clear_completion_state();
+          editor_.text.clear();
+          editor_.cursor = 0;
+        }
+        send_cursor_sequence("\x1b[A", "\x1bOA");
+        break;
+      case XK_KP_Up:
+        if (!tui_mode) {
+          clear_completion_state();
+          editor_.text.clear();
+          editor_.cursor = 0;
+        }
+        send_cursor_sequence("\x1b[A", "\x1bOA");
         break;
       case XK_Down:
-        clear_completion_state();
-        editor_.text.clear();
-        editor_.cursor = 0;
-        send_bytes("\x1b[B", 3);
+        if (!tui_mode) {
+          clear_completion_state();
+          editor_.text.clear();
+          editor_.cursor = 0;
+        }
+        send_cursor_sequence("\x1b[B", "\x1bOB");
+        break;
+      case XK_KP_Down:
+        if (!tui_mode) {
+          clear_completion_state();
+          editor_.text.clear();
+          editor_.cursor = 0;
+        }
+        send_cursor_sequence("\x1b[B", "\x1bOB");
         break;
       case XK_Home:
-        move_cursor_home();
+        if (!tui_mode) {
+          move_cursor_home();
+        }
+        send_cursor_sequence("\x1b[H", "\x1bOH");
+        break;
+      case XK_KP_Home:
+        if (!tui_mode) {
+          move_cursor_home();
+        }
+        send_cursor_sequence("\x1b[H", "\x1bOH");
         break;
       case XK_End:
-        move_cursor_end();
+        if (!tui_mode) {
+          move_cursor_end();
+        }
+        send_cursor_sequence("\x1b[F", "\x1bOF");
+        break;
+      case XK_KP_End:
+        if (!tui_mode) {
+          move_cursor_end();
+        }
+        send_cursor_sequence("\x1b[F", "\x1bOF");
         break;
       case XK_Delete:
-        erase_next_character();
+        if (tui_mode) {
+          send_bytes("\x1b[3~", 4);
+        } else {
+          erase_next_character();
+        }
+        break;
+      case XK_KP_Delete:
+        if (tui_mode) {
+          send_bytes("\x1b[3~", 4);
+        } else {
+          erase_next_character();
+        }
         break;
       case XK_Page_Up:
+        send_bytes("\x1b[5~", 4);
+        break;
+      case XK_KP_Page_Up:
         send_bytes("\x1b[5~", 4);
         break;
       case XK_Page_Down:
         send_bytes("\x1b[6~", 4);
         break;
+      case XK_KP_Page_Down:
+        send_bytes("\x1b[6~", 4);
+        break;
       default:
         break;
     }
-    refresh_completion_state();
+    if (!tui_mode) {
+      refresh_completion_state();
+    }
   }
 
   void reset_screen() {
@@ -2606,6 +3048,9 @@ private:
     g0_special_graphics_ = false;
     g1_special_graphics_ = false;
     use_g1_charset_ = false;
+    application_cursor_keys_ = false;
+    application_keypad_mode_ = false;
+    reset_scroll_region();
     state_ = ParseState::Ground;
     csi_params_.clear();
     csi_current_ = 0;
@@ -2731,9 +3176,14 @@ private:
   bool mouse_reporting_ = false;
   bool mouse_motion_reporting_ = false;
   bool mouse_sgr_mode_ = false;
+  bool application_cursor_keys_ = false;
+  bool application_keypad_mode_ = false;
+  bool origin_mode_ = false;
   bool g0_special_graphics_ = false;
   bool g1_special_graphics_ = false;
   bool use_g1_charset_ = false;
+  int scroll_region_top_ = 0;
+  int scroll_region_bottom_ = 0;
   std::string utf8_pending_;
   unsigned int utf8_expected_ = 0;
   std::string osc_buffer_;
@@ -2755,6 +3205,8 @@ private:
   struct AlternateScreenState {
     bool active = false;
     std::vector<Cell> cells;
+    unsigned int cols = 0;
+    unsigned int rows = 0;
     std::deque<std::vector<Cell>> history_rows;
     std::size_t scrollback_offset = 0;
     int cursor_x = 0;
@@ -2763,6 +3215,9 @@ private:
     unsigned long current_bg_pixel = 0;
     bool current_bold = false;
     bool current_inverse = false;
+    int scroll_region_top = 0;
+    int scroll_region_bottom = 0;
+    bool origin_mode = false;
     bool g0_special_graphics = false;
     bool g1_special_graphics = false;
     bool use_g1_charset = false;

@@ -170,6 +170,108 @@ bool is_generic_launcher_label(const std::string& label) {
   return key == "terminal" || key == "modernterminal" || key == "newterminal" || key == "filebrowser" || key == "filemanager" || key == "files" || key == "config" || key == "openconfig";
 }
 
+struct ApplicationsLayout {
+  int inset = 16;
+  int title_y = 0;
+  int form_x = 0;
+  int form_y = 0;
+  unsigned int form_w = 0;
+  unsigned int form_h = 0;
+  int header_y = 0;
+  unsigned int header_h = 28;
+  int toggle_x = 0;
+  int toggle_y = 0;
+  unsigned int toggle_w = 18;
+  unsigned int toggle_h = 18;
+  int field_inset = 0;
+  int name_x = 0;
+  int name_y = 0;
+  unsigned int name_w = 0;
+  unsigned int field_h = 24;
+  int command_x = 0;
+  int command_y = 0;
+  unsigned int command_w = 0;
+  int button_y = 0;
+  unsigned int button_w = 72;
+  unsigned int button_h = 22;
+  int open_x = 0;
+  int add_x = 0;
+  int update_x = 0;
+  int remove_x = 0;
+  int clear_x = 0;
+  int style_label_y = 0;
+  int style_row_y = 0;
+  int style_x = 0;
+  unsigned int style_chip_w = 58;
+  unsigned int style_chip_h = 18;
+  int panel_x = 0;
+  int panel_y = 0;
+  unsigned int panel_w = 0;
+  unsigned int panel_h = 0;
+  int footer_y = 0;
+};
+
+constexpr unsigned int kApplicationStyleCount = 4;
+
+ApplicationsLayout applications_layout_for(unsigned int width, unsigned int height, bool collapsed) {
+  ApplicationsLayout layout;
+  layout.title_y = 30;
+  layout.form_x = layout.inset;
+  layout.form_y = 52;
+  layout.form_w = width > static_cast<unsigned int>(layout.inset * 2) ? width - static_cast<unsigned int>(layout.inset * 2) : 1u;
+  layout.header_y = layout.form_y + 6;
+  layout.toggle_x = layout.form_x + static_cast<int>(layout.form_w) - 30;
+  layout.toggle_y = layout.header_y + 4;
+  layout.field_inset = 16;
+  layout.name_x = layout.form_x + layout.field_inset;
+  layout.name_y = layout.header_y + static_cast<int>(layout.header_h) + 18;
+  layout.name_w = layout.form_w > static_cast<unsigned int>(layout.field_inset * 2) ? layout.form_w - static_cast<unsigned int>(layout.field_inset * 2) : 120u;
+  layout.command_x = layout.name_x;
+  layout.command_y = layout.name_y + static_cast<int>(layout.field_h) + 26;
+  layout.command_w = layout.name_w;
+  const unsigned int button_gap = 8;
+  const unsigned int button_count = 5;
+  const unsigned int button_area_w = layout.form_w > static_cast<unsigned int>(layout.field_inset * 2) ? layout.form_w - static_cast<unsigned int>(layout.field_inset * 2) : 1u;
+  const unsigned int ideal_button_w = button_area_w > button_gap * (button_count - 1) ? (button_area_w - button_gap * (button_count - 1)) / button_count : 56u;
+  layout.button_w = std::clamp(ideal_button_w, 56u, 84u);
+  layout.button_y = layout.command_y + static_cast<int>(layout.field_h) + 22;
+  layout.open_x = layout.form_x + layout.field_inset;
+  layout.add_x = layout.open_x + static_cast<int>(layout.button_w + button_gap);
+  layout.update_x = layout.add_x + static_cast<int>(layout.button_w + button_gap);
+  layout.remove_x = layout.update_x + static_cast<int>(layout.button_w + button_gap);
+  layout.clear_x = layout.remove_x + static_cast<int>(layout.button_w + button_gap);
+  layout.style_label_y = layout.button_y + static_cast<int>(layout.button_h) + 20;
+  layout.style_row_y = layout.style_label_y + 10;
+  layout.style_x = layout.form_x + layout.field_inset;
+  const unsigned int chip_gap = 6;
+  const unsigned int chip_count = kApplicationStyleCount;
+  const unsigned int chip_area_w = layout.form_w > static_cast<unsigned int>(layout.field_inset * 2) ? layout.form_w - static_cast<unsigned int>(layout.field_inset * 2) : 1u;
+  const unsigned int ideal_chip_w = chip_area_w > chip_gap * (chip_count - 1) ? (chip_area_w - chip_gap * (chip_count - 1)) / chip_count : 52u;
+  layout.style_chip_w = std::clamp(ideal_chip_w, 52u, 88u);
+  if (collapsed) {
+    layout.form_h = layout.header_h + 14;
+  } else {
+    layout.form_h = static_cast<unsigned int>((layout.style_row_y + static_cast<int>(layout.style_chip_h) + 18) - layout.form_y);
+  }
+  layout.panel_x = layout.inset;
+  layout.panel_y = layout.form_y + static_cast<int>(layout.form_h) + 36;
+  layout.panel_w = width > static_cast<unsigned int>(layout.inset * 2) ? width - static_cast<unsigned int>(layout.inset * 2) : 1u;
+  layout.panel_h = height > static_cast<unsigned int>(layout.panel_y + 40) ? height - static_cast<unsigned int>(layout.panel_y + 40) : 1u;
+  layout.footer_y = static_cast<int>(height) - 14;
+  return layout;
+}
+
+const char* application_style_name(unsigned int style) {
+  switch (style % kApplicationStyleCount) {
+    case 0: return "Document";
+    case 1: return "Tool";
+    case 2: return "Folder";
+    default: return "Monitor";
+  }
+}
+
+constexpr int kApplicationsIconWidth = 88;
+constexpr int kApplicationsIconHeight = 72;
 XFontStruct* load_about_title_font(Display* display) {
   static XFontStruct* font = nullptr;
   static bool attempted = false;
@@ -951,6 +1053,39 @@ void WindowManager::open_file_manager_window() {
   }
 }
 
+void WindowManager::open_applications_window() {
+  if (applications_window_ != 0) {
+    if (Client* client = find_client(applications_window_)) {
+      if (client->iconic) {
+        deiconify_client(*client);
+      }
+      focus_client(client);
+      draw_internal_content(*client);
+      return;
+    }
+    applications_window_ = 0;
+  }
+
+  const unsigned int width = static_cast<unsigned int>(std::max(520, DisplayWidth(display_, screen_) - 80));
+  const unsigned int height = 620;
+  const int x = std::max(0, (DisplayWidth(display_, screen_) - static_cast<int>(width)) / 2 + 8);
+  const int y = std::max(24, (DisplayHeight(display_, screen_) - static_cast<int>(height)) / 2 + 8);
+  applications_details_collapsed_ = true;
+  applications_window_ = XCreateSimpleWindow(display_, root_, x, y, width, height, 0, theme_.frame_active_pixel, theme_.menu_pixel);
+  XStoreName(display_, applications_window_, "Applications");
+  manage_window(applications_window_);
+  if (Client* client = find_client(applications_window_)) {
+    client->internal_kind = InternalKind::Applications;
+    XMapWindow(display_, client->shadow);
+    XMapWindow(display_, client->frame);
+    XMapWindow(display_, client->window);
+    std::array<Window, 2> restack{client->frame, client->shadow};
+    XRestackWindows(display_, restack.data(), 2);
+    focus_client(client);
+    draw_internal_content(*client);
+  }
+}
+
 void WindowManager::open_preferences_window() {
   if (preferences_window_ != 0) {
     if (Client* client = find_client(preferences_window_)) {
@@ -1056,6 +1191,8 @@ void WindowManager::run_launcher_command(const std::string& command) {
     const std::string action = command.substr(6);
     if (action == "open-file-manager") {
       open_file_manager_window();
+    } else if (action == "open-applications") {
+      open_applications_window();
     } else if (action == "open-execute") {
       open_execute_window();
     } else if (action == "open-preferences") {
@@ -1105,6 +1242,8 @@ void WindowManager::draw_internal_content(Client& client) {
     draw_execute_window(client);
   } else if (client.internal_kind == InternalKind::Browser) {
     draw_file_manager_window(client);
+  } else if (client.internal_kind == InternalKind::Applications) {
+    draw_applications_window(client);
   } else if (client.internal_kind == InternalKind::Preferences) {
     draw_preferences_window(client);
   } else if (client.internal_kind == InternalKind::About) {
@@ -1245,6 +1384,309 @@ void WindowManager::draw_file_manager_window(Client& client) {
     XDrawString(display_, target, gc, list_x + 8, top + 14, label.c_str(), static_cast<int>(label.size()));
   }
   XFreeGC(display_, gc);
+}
+
+void WindowManager::draw_applications_window(Client& client) {
+  Drawable target = client.content_backing ? client.content_backing : client.window;
+  const unsigned int draw_width = client.content_backing ? client.content_width : client.width;
+  const unsigned int draw_height = client.content_backing ? client.content_height : client.height;
+  const ApplicationsLayout layout = applications_layout_for(draw_width, draw_height, applications_details_collapsed_);
+  GC gc = XCreateGC(display_, target, 0, nullptr);
+  XSetForeground(display_, gc, theme_.menu_pixel);
+  XFillRectangle(display_, target, gc, 0, 0, draw_width, draw_height);
+
+  XSetForeground(display_, gc, theme_.shadow_pixel);
+  XDrawLine(display_, target, gc, 1, static_cast<int>(draw_height) - 2, static_cast<int>(draw_width) - 2, static_cast<int>(draw_height) - 2);
+  XDrawLine(display_, target, gc, static_cast<int>(draw_width) - 2, 1, static_cast<int>(draw_width) - 2, static_cast<int>(draw_height) - 2);
+  XSetForeground(display_, gc, theme_.frame_active_pixel);
+  XDrawRectangle(display_, target, gc, 0, 0, draw_width - 1, draw_height - 1);
+
+  const std::string title = "Applications";
+  XFontStruct* title_font = load_about_title_font(display_);
+  XFontStruct* body_font = load_about_body_font(display_);
+  if (title_font) {
+    XSetFont(display_, gc, title_font->fid);
+  }
+  const int title_x = std::max(0, static_cast<int>(draw_width / 2) - text_width(title_font, title) / 2);
+  XSetForeground(display_, gc, theme_.menu_text_pixel);
+  XDrawString(display_, target, gc, title_x, layout.title_y, title.c_str(), static_cast<int>(title.size()));
+  if (body_font) {
+    XSetFont(display_, gc, body_font->fid);
+  }
+
+  const auto draw_panel = [&](int x, int y, unsigned int w, unsigned int h) {
+    XSetForeground(display_, gc, theme_.frame_active_pixel);
+    XDrawRectangle(display_, target, gc, x, y, w, h);
+    XSetForeground(display_, gc, theme_.menu_pixel);
+    XFillRectangle(display_, target, gc, x + 1, y + 1, w > 2 ? w - 2 : 1u, h > 2 ? h - 2 : 1u);
+  };
+
+  draw_panel(layout.form_x, layout.form_y, layout.form_w, layout.form_h);
+  XSetForeground(display_, gc, theme_.shadow_pixel);
+  XDrawLine(display_, target, gc, layout.form_x + 1, layout.header_y + static_cast<int>(layout.header_h), layout.form_x + static_cast<int>(layout.form_w) - 2, layout.header_y + static_cast<int>(layout.header_h));
+  XSetForeground(display_, gc, theme_.menu_text_pixel);
+  XDrawString(display_, target, gc, layout.form_x + 14, layout.header_y + 16, "Application Details", 19);
+  XSetForeground(display_, gc, theme_.title_text_pixel);
+  XFillRectangle(display_, target, gc, layout.toggle_x, layout.toggle_y, layout.toggle_w, layout.toggle_h);
+  XSetForeground(display_, gc, theme_.frame_active_pixel);
+  XDrawRectangle(display_, target, gc, layout.toggle_x, layout.toggle_y, layout.toggle_w, layout.toggle_h);
+  const char* toggle_text = applications_details_collapsed_ ? "+" : "-";
+  const int toggle_text_width = body_font ? text_width(body_font, toggle_text) : 6;
+  const int toggle_text_x = layout.toggle_x + std::max(4, (static_cast<int>(layout.toggle_w) - toggle_text_width) / 2);
+  const int toggle_text_y = layout.toggle_y + static_cast<int>(layout.toggle_h / 2) + (body_font ? (body_font->ascent - body_font->descent) / 2 : 4);
+  XDrawString(display_, target, gc, toggle_text_x, toggle_text_y, toggle_text, 1);
+
+  auto draw_field = [&](int x, int y, unsigned int w, const std::string& label, const std::string& value, bool active) {
+    XSetForeground(display_, gc, theme_.frame_inactive_pixel);
+    XDrawString(display_, target, gc, x, y - 4, label.c_str(), static_cast<int>(label.size()));
+    XSetForeground(display_, gc, theme_.title_text_pixel);
+    XFillRectangle(display_, target, gc, x, y, w, layout.field_h);
+    XSetForeground(display_, gc, theme_.frame_active_pixel);
+    XDrawRectangle(display_, target, gc, x, y, w, layout.field_h);
+    if (active) {
+      XSetForeground(display_, gc, theme_.shadow_pixel);
+      XDrawRectangle(display_, target, gc, x + 1, y + 1, w > 2 ? w - 2 : 1u, layout.field_h > 2 ? layout.field_h - 2 : 1u);
+    }
+    const std::string shown = shorten_label(value, w > 18 ? (w - 12) / 6 : 1);
+    XSetForeground(display_, gc, theme_.menu_text_pixel);
+    XDrawString(display_, target, gc, x + 6, y + 16, shown.c_str(), static_cast<int>(shown.size()));
+    if (active) {
+      const int shown_width = body_font ? text_width(body_font, shown) : static_cast<int>(shown.size()) * 6;
+      const int cursor_x = x + 6 + shown_width;
+      XDrawLine(display_, target, gc, cursor_x, y + 6, cursor_x, y + 18);
+    }
+  };
+
+  if (!applications_details_collapsed_) {
+    draw_field(layout.name_x, layout.name_y, layout.name_w, "Name", application_name_buffer_, applications_active_field_ == ApplicationsField::Name);
+    draw_field(layout.command_x, layout.command_y, layout.command_w, "Path", application_command_buffer_, applications_active_field_ == ApplicationsField::Command);
+  }
+
+  auto draw_button = [&](int x, const char* text, bool enabled) {
+    XSetForeground(display_, gc, enabled ? theme_.menu_pixel : theme_.title_text_pixel);
+    XFillRectangle(display_, target, gc, x, layout.button_y, layout.button_w, layout.button_h);
+    XSetForeground(display_, gc, theme_.frame_active_pixel);
+    XDrawRectangle(display_, target, gc, x, layout.button_y, layout.button_w, layout.button_h);
+    const int label_width = body_font ? text_width(body_font, text) : static_cast<int>(std::strlen(text)) * 6;
+    const int text_x = x + std::max(4, (static_cast<int>(layout.button_w) - label_width) / 2);
+    const int text_y = layout.button_y + static_cast<int>(layout.button_h / 2) + (body_font ? (body_font->ascent - body_font->descent) / 2 : 4);
+    XSetForeground(display_, gc, enabled ? theme_.menu_text_pixel : theme_.frame_inactive_pixel);
+    XDrawString(display_, target, gc, text_x, text_y, text, static_cast<int>(std::strlen(text)));
+  };
+
+  const bool has_selection = applications_selected_ && *applications_selected_ < config_.applications.size();
+  if (!applications_details_collapsed_) {
+    draw_button(layout.open_x, "Open", has_selection);
+    draw_button(layout.add_x, "Add", !application_name_buffer_.empty() && !application_command_buffer_.empty());
+    draw_button(layout.update_x, "Update", has_selection);
+    draw_button(layout.remove_x, "Remove", has_selection);
+    draw_button(layout.clear_x, "Clear", has_selection || !application_name_buffer_.empty() || !application_command_buffer_.empty());
+
+    XSetForeground(display_, gc, theme_.frame_inactive_pixel);
+    XDrawString(display_, target, gc, layout.style_x, layout.style_label_y, "Icon Style", 10);
+    for (unsigned int style = 0; style < kApplicationStyleCount; ++style) {
+      const int chip_x = layout.style_x + static_cast<int>(style) * static_cast<int>(layout.style_chip_w + 6);
+      const bool selected_style = application_style_index_ == style;
+      XSetForeground(display_, gc, selected_style ? theme_.menu_pixel : theme_.title_text_pixel);
+      XFillRectangle(display_, target, gc, chip_x, layout.style_row_y, layout.style_chip_w, layout.style_chip_h);
+      XSetForeground(display_, gc, theme_.frame_active_pixel);
+      XDrawRectangle(display_, target, gc, chip_x, layout.style_row_y, layout.style_chip_w, layout.style_chip_h);
+      XSetForeground(display_, gc, selected_style ? theme_.menu_text_pixel : theme_.frame_inactive_pixel);
+      const char* style_name = application_style_name(style);
+      const int label_width = body_font ? text_width(body_font, style_name) : static_cast<int>(std::strlen(style_name)) * 6;
+      const int text_x = chip_x + std::max(4, (static_cast<int>(layout.style_chip_w) - label_width) / 2);
+      const int text_y = layout.style_row_y + static_cast<int>(layout.style_chip_h / 2) + (body_font ? (body_font->ascent - body_font->descent) / 2 : 4);
+      XDrawString(display_, target, gc, text_x, text_y, style_name, static_cast<int>(std::strlen(style_name)));
+    }
+  }
+
+  draw_panel(layout.panel_x, layout.panel_y, layout.panel_w, layout.panel_h);
+  XSetForeground(display_, gc, theme_.frame_inactive_pixel);
+  XDrawString(display_, target, gc, layout.panel_x + 12, layout.panel_y - 6, "Finder Grid", 11);
+
+  if (config_.applications.empty()) {
+    XSetForeground(display_, gc, theme_.frame_inactive_pixel);
+    const std::string empty = "No applications yet. Add one above, then drag icons freely in the finder grid.";
+    XDrawString(display_, target, gc, layout.panel_x + 18, layout.panel_y + 24, empty.c_str(), static_cast<int>(empty.size()));
+  }
+
+  for (std::size_t index = 0; index < config_.applications.size(); ++index) {
+    const auto& entry = config_.applications[index];
+    const int icon_x = layout.panel_x + entry.x;
+    const int icon_y = layout.panel_y + entry.y;
+    if (icon_x + kApplicationsIconWidth < layout.panel_x || icon_y + kApplicationsIconHeight < layout.panel_y ||
+        icon_x > layout.panel_x + static_cast<int>(layout.panel_w) || icon_y > layout.panel_y + static_cast<int>(layout.panel_h)) {
+      continue;
+    }
+    const bool selected = applications_selected_ && *applications_selected_ == index;
+    if (selected) {
+      XSetForeground(display_, gc, theme_.frame_active_pixel);
+      XFillRectangle(display_, target, gc, icon_x - 3, icon_y - 3, kApplicationsIconWidth + 6, kApplicationsIconHeight + 16);
+      XSetForeground(display_, gc, theme_.menu_pixel);
+      XFillRectangle(display_, target, gc, icon_x - 2, icon_y - 2, kApplicationsIconWidth + 4, kApplicationsIconHeight + 14);
+    }
+    const unsigned int style = entry.style % kApplicationStyleCount;
+    XSetForeground(display_, gc, theme_.shadow_pixel);
+    XFillRectangle(display_, target, gc, icon_x + 7, icon_y + 7, 42, 28);
+    XSetForeground(display_, gc, theme_.menu_pixel);
+    XFillRectangle(display_, target, gc, icon_x + 4, icon_y + 4, 42, 28);
+    XSetForeground(display_, gc, theme_.frame_active_pixel);
+    XDrawRectangle(display_, target, gc, icon_x + 4, icon_y + 4, 42, 28);
+    if (style == 0) {
+      XFillRectangle(display_, target, gc, icon_x + 10, icon_y + 10, 28, 3);
+      XFillRectangle(display_, target, gc, icon_x + 10, icon_y + 17, 24, 3);
+      XFillRectangle(display_, target, gc, icon_x + 10, icon_y + 24, 20, 3);
+    } else if (style == 1) {
+      XDrawRectangle(display_, target, gc, icon_x + 11, icon_y + 10, 20, 14);
+      XFillRectangle(display_, target, gc, icon_x + 33, icon_y + 12, 7, 10);
+      XDrawLine(display_, target, gc, icon_x + 31, icon_y + 12, icon_x + 33, icon_y + 12);
+      XDrawLine(display_, target, gc, icon_x + 31, icon_y + 22, icon_x + 33, icon_y + 22);
+    } else if (style == 2) {
+      XFillRectangle(display_, target, gc, icon_x + 9, icon_y + 12, 28, 14);
+      XFillRectangle(display_, target, gc, icon_x + 12, icon_y + 9, 12, 4);
+      XDrawRectangle(display_, target, gc, icon_x + 9, icon_y + 12, 28, 14);
+    } else {
+      XDrawRectangle(display_, target, gc, icon_x + 10, icon_y + 10, 26, 16);
+      XFillRectangle(display_, target, gc, icon_x + 18, icon_y + 28, 10, 2);
+      XDrawLine(display_, target, gc, icon_x + 23, icon_y + 26, icon_x + 23, icon_y + 28);
+    }
+    const std::string label = shorten_label(entry.label, 13);
+    const std::string path_line = shorten_label(entry.command, 14);
+    XSetForeground(display_, gc, theme_.menu_text_pixel);
+    XDrawString(display_, target, gc, icon_x, icon_y + 47, label.c_str(), static_cast<int>(label.size()));
+    XSetForeground(display_, gc, theme_.frame_inactive_pixel);
+    XDrawString(display_, target, gc, icon_x, icon_y + 61, path_line.c_str(), static_cast<int>(path_line.size()));
+  }
+
+  const std::string footer = has_selection
+      ? "Selected: " + config_.applications[*applications_selected_].label + "   Open, update, remove, or drag it."
+      : "Select an icon to edit it. Drag to reposition. Open launches the selected application.";
+  XSetForeground(display_, gc, theme_.frame_inactive_pixel);
+  XDrawString(display_, target, gc, layout.inset, layout.footer_y, footer.c_str(), static_cast<int>(footer.size()));
+
+  XFreeGC(display_, gc);
+}
+
+std::optional<std::size_t> WindowManager::hit_test_application_icon(const Client& client, int x, int y) const {
+  const ApplicationsLayout layout = applications_layout_for(client.width, client.height, applications_details_collapsed_);
+  for (std::size_t index = 0; index < config_.applications.size(); ++index) {
+    const auto& entry = config_.applications[index];
+    const int icon_x = layout.panel_x + entry.x;
+    const int icon_y = layout.panel_y + entry.y;
+    if (x >= icon_x && x <= icon_x + kApplicationsIconWidth &&
+        y >= icon_y && y <= icon_y + kApplicationsIconHeight) {
+      return index;
+    }
+  }
+  return std::nullopt;
+}
+
+void WindowManager::persist_applications() {
+  save_config();
+}
+
+void WindowManager::add_application_entry() {
+  auto trim = [](std::string value) {
+    auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](char c) { return !is_space(static_cast<unsigned char>(c)); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(), [&](char c) { return !is_space(static_cast<unsigned char>(c)); }).base(), value.end());
+    return value;
+  };
+  const std::string name = trim(application_name_buffer_);
+  const std::string command = trim(application_command_buffer_);
+  if (name.empty() || command.empty()) {
+    return;
+  }
+  if (std::any_of(config_.applications.begin(), config_.applications.end(), [&](const config::ApplicationEntry& entry) {
+        return entry.label == name && entry.command == command;
+      })) {
+    applications_selected_ = static_cast<std::size_t>(std::distance(config_.applications.begin(),
+        std::find_if(config_.applications.begin(), config_.applications.end(), [&](const config::ApplicationEntry& entry) {
+          return entry.label == name && entry.command == command;
+        })));
+    load_selected_application_into_form();
+    persist_applications();
+    return;
+  }
+
+  int place_x = 18;
+  int place_y = 18;
+  if (Client* client = applications_window_ != 0 ? find_client(applications_window_) : nullptr) {
+    const ApplicationsLayout layout = applications_layout_for(client->width, client->height, applications_details_collapsed_);
+    const int stride_x = 96;
+    const int stride_y = 84;
+    const int columns = std::max(1, static_cast<int>(layout.panel_w) / stride_x);
+    const int slot = static_cast<int>(config_.applications.size());
+    place_x = 18 + (slot % columns) * stride_x;
+    place_y = 18 + (slot / columns) * stride_y;
+  }
+
+  config_.applications.push_back({name, command, place_x, place_y});
+  config_.applications.back().style = application_style_index_ % kApplicationStyleCount;
+  applications_selected_ = config_.applications.size() - 1;
+  load_selected_application_into_form();
+  persist_applications();
+}
+
+void WindowManager::update_selected_application() {
+  if (!applications_selected_ || *applications_selected_ >= config_.applications.size()) {
+    return;
+  }
+  auto trim = [](std::string value) {
+    auto is_space = [](unsigned char c) { return std::isspace(c) != 0; };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](char c) { return !is_space(static_cast<unsigned char>(c)); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(), [&](char c) { return !is_space(static_cast<unsigned char>(c)); }).base(), value.end());
+    return value;
+  };
+  const std::string name = trim(application_name_buffer_);
+  const std::string command = trim(application_command_buffer_);
+  if (name.empty() || command.empty()) {
+    return;
+  }
+  auto& entry = config_.applications[*applications_selected_];
+  entry.label = name;
+  entry.command = command;
+  entry.style = application_style_index_ % kApplicationStyleCount;
+  persist_applications();
+}
+
+void WindowManager::remove_selected_application() {
+  if (!applications_selected_ || *applications_selected_ >= config_.applications.size()) {
+    return;
+  }
+  config_.applications.erase(config_.applications.begin() + static_cast<std::ptrdiff_t>(*applications_selected_));
+  clear_application_form(true);
+  persist_applications();
+}
+
+void WindowManager::clear_application_form(bool clear_selection) {
+  application_name_buffer_.clear();
+  application_command_buffer_.clear();
+  application_style_index_ = 0;
+  applications_active_field_ = ApplicationsField::Name;
+  if (clear_selection) {
+    applications_selected_.reset();
+  }
+}
+
+void WindowManager::load_selected_application_into_form() {
+  if (!applications_selected_ || *applications_selected_ >= config_.applications.size()) {
+    return;
+  }
+  const auto& entry = config_.applications[*applications_selected_];
+  application_name_buffer_ = entry.label;
+  application_command_buffer_ = entry.command;
+  application_style_index_ = entry.style % kApplicationStyleCount;
+  applications_active_field_ = ApplicationsField::Name;
+}
+
+void WindowManager::cycle_application_style(int delta) {
+  const int count = static_cast<int>(kApplicationStyleCount);
+  int next = static_cast<int>(application_style_index_) + delta;
+  while (next < 0) {
+    next += count;
+  }
+  application_style_index_ = static_cast<unsigned int>(next % count);
 }
 
 void WindowManager::draw_preferences_window(Client& client) {
@@ -1594,6 +2036,81 @@ void WindowManager::draw_home_window(Client& client) {
 
 void WindowManager::handle_internal_button_press(Client& client, const XButtonEvent& event) {
   focus_client(&client);
+  if (client.internal_kind == InternalKind::Applications) {
+    const ApplicationsLayout layout = applications_layout_for(client.width, client.height, applications_details_collapsed_);
+    const auto inside = [](int px, int py, int x, int y, unsigned int w, unsigned int h) {
+      return px >= x && px <= x + static_cast<int>(w) && py >= y && py <= y + static_cast<int>(h);
+    };
+    if (inside(event.x, event.y, layout.toggle_x, layout.toggle_y, layout.toggle_w, layout.toggle_h)) {
+      applications_details_collapsed_ = !applications_details_collapsed_;
+      draw_internal_content(client);
+      return;
+    }
+    if (!applications_details_collapsed_) {
+      if (inside(event.x, event.y, layout.name_x, layout.name_y, layout.name_w, layout.field_h)) {
+        applications_active_field_ = ApplicationsField::Name;
+        draw_internal_content(client);
+        return;
+      }
+      if (inside(event.x, event.y, layout.command_x, layout.command_y, layout.command_w, layout.field_h)) {
+        applications_active_field_ = ApplicationsField::Command;
+        draw_internal_content(client);
+        return;
+      }
+      if (inside(event.x, event.y, layout.open_x, layout.button_y, layout.button_w, layout.button_h)) {
+        if (applications_selected_ && *applications_selected_ < config_.applications.size()) {
+          run_launcher_command(config_.applications[*applications_selected_].command);
+        }
+        return;
+      }
+      if (inside(event.x, event.y, layout.add_x, layout.button_y, layout.button_w, layout.button_h)) {
+        add_application_entry();
+        draw_internal_content(client);
+        return;
+      }
+      if (inside(event.x, event.y, layout.update_x, layout.button_y, layout.button_w, layout.button_h)) {
+        update_selected_application();
+        draw_internal_content(client);
+        return;
+      }
+      if (inside(event.x, event.y, layout.remove_x, layout.button_y, layout.button_w, layout.button_h)) {
+        remove_selected_application();
+        draw_internal_content(client);
+        return;
+      }
+      if (inside(event.x, event.y, layout.clear_x, layout.button_y, layout.button_w, layout.button_h)) {
+        clear_application_form(true);
+        draw_internal_content(client);
+        return;
+      }
+      for (unsigned int style = 0; style < kApplicationStyleCount; ++style) {
+        const int chip_x = layout.style_x + static_cast<int>(style) * static_cast<int>(layout.style_chip_w + 6);
+        if (inside(event.x, event.y, chip_x, layout.style_row_y, layout.style_chip_w, layout.style_chip_h)) {
+          application_style_index_ = style;
+          draw_internal_content(client);
+          return;
+        }
+      }
+    }
+    const auto hit = hit_test_application_icon(client, event.x, event.y);
+    if (!hit) {
+      clear_application_form(true);
+      applications_drag_index_.reset();
+      draw_internal_content(client);
+      return;
+    }
+    applications_selected_ = hit;
+    load_selected_application_into_form();
+    applications_drag_index_ = hit;
+    applications_drag_moved_ = false;
+    applications_drag_start_x_ = event.x;
+    applications_drag_start_y_ = event.y;
+    applications_drag_offset_x_ = event.x - (layout.panel_x + config_.applications[*hit].x);
+    applications_drag_offset_y_ = event.y - (layout.panel_y + config_.applications[*hit].y);
+    grab_pointer_for_drag(client.window);
+    draw_internal_content(client);
+    return;
+  }
   if (client.internal_kind != InternalKind::Browser) {
     if (client.internal_kind == InternalKind::Preferences) {
       if (preferences_palette_.empty()) {
@@ -1641,6 +2158,19 @@ void WindowManager::handle_internal_button_press(Client& client, const XButtonEv
 }
 
 void WindowManager::handle_internal_button_release(Client& client, const XButtonEvent&) {
+  if (client.internal_kind == InternalKind::Applications) {
+    if (applications_drag_index_) {
+      if (applications_drag_moved_) {
+        persist_applications();
+      } else if (*applications_drag_index_ < config_.applications.size()) {
+        run_launcher_command(config_.applications[*applications_drag_index_].command);
+      }
+    }
+    applications_drag_index_.reset();
+    applications_drag_moved_ = false;
+    ungrab_pointer_for_drag();
+    return;
+  }
   if (client.internal_kind != InternalKind::Browser) {
     return;
   }
@@ -1671,6 +2201,27 @@ void WindowManager::handle_internal_button_release(Client& client, const XButton
 }
 
 void WindowManager::handle_internal_motion_notify(Client& client, const XMotionEvent& event) {
+  if (client.internal_kind == InternalKind::Applications) {
+    if (!applications_drag_index_ || *applications_drag_index_ >= config_.applications.size()) {
+      return;
+    }
+    if (!applications_drag_moved_) {
+      const int dx = std::abs(event.x - applications_drag_start_x_);
+      const int dy = std::abs(event.y - applications_drag_start_y_);
+      if (dx < 4 && dy < 4) {
+        return;
+      }
+      applications_drag_moved_ = true;
+    }
+    const ApplicationsLayout layout = applications_layout_for(client.width, client.height, applications_details_collapsed_);
+    auto& entry = config_.applications[*applications_drag_index_];
+    const int max_x = std::max(0, static_cast<int>(layout.panel_w) - kApplicationsIconWidth - 8);
+    const int max_y = std::max(0, static_cast<int>(layout.panel_h) - kApplicationsIconHeight - 8);
+    entry.x = std::clamp(event.x - layout.panel_x - applications_drag_offset_x_, 8, max_x);
+    entry.y = std::clamp(event.y - layout.panel_y - applications_drag_offset_y_, 8, max_y);
+    draw_internal_content(client);
+    return;
+  }
   if (client.internal_kind != InternalKind::Browser) {
     return;
   }
@@ -1768,6 +2319,69 @@ void WindowManager::handle_internal_key_press(Client& client, const XKeyEvent& e
         draw_internal_content(client);
       }
     }
+  } else if (client.internal_kind == InternalKind::Applications) {
+    if (applications_details_collapsed_) {
+      const KeySym sym = XLookupKeysym(const_cast<XKeyEvent*>(&event), 0);
+      if (sym == XK_Delete) {
+        remove_selected_application();
+      } else if (sym == XK_Escape) {
+        clear_application_form(true);
+      } else if ((sym == XK_Return || sym == XK_KP_Enter) && applications_selected_ && *applications_selected_ < config_.applications.size()) {
+        run_launcher_command(config_.applications[*applications_selected_].command);
+      }
+      draw_internal_content(client);
+      return;
+    }
+    char text[64] = {};
+    KeySym sym = NoSymbol;
+    const int len = XLookupString(const_cast<XKeyEvent*>(&event), text, sizeof(text) - 1, &sym, nullptr);
+    std::string& active_buffer = applications_active_field_ == ApplicationsField::Name ? application_name_buffer_ : application_command_buffer_;
+    if (sym == XK_Return || sym == XK_KP_Enter) {
+      if (applications_selected_) {
+        update_selected_application();
+      } else {
+        add_application_entry();
+      }
+    } else if (sym == XK_BackSpace) {
+      if (!active_buffer.empty()) {
+        active_buffer.pop_back();
+      }
+    } else if (sym == XK_Tab) {
+      applications_active_field_ = applications_active_field_ == ApplicationsField::Name
+          ? ApplicationsField::Command
+          : ApplicationsField::Name;
+    } else if (sym == XK_Left) {
+      cycle_application_style(-1);
+    } else if (sym == XK_Right) {
+      cycle_application_style(1);
+    } else if (sym == XK_Delete) {
+      remove_selected_application();
+    } else if (sym == XK_Up) {
+      if (applications_selected_ && *applications_selected_ > 0) {
+        applications_selected_ = *applications_selected_ - 1;
+        load_selected_application_into_form();
+      }
+    } else if (sym == XK_Down) {
+      if (applications_selected_ && *applications_selected_ + 1 < config_.applications.size()) {
+        applications_selected_ = *applications_selected_ + 1;
+        load_selected_application_into_form();
+      }
+    } else if (sym == XK_Escape) {
+      if (!application_name_buffer_.empty() || !application_command_buffer_.empty()) {
+        clear_application_form(false);
+      } else {
+        XDestroyWindow(display_, client.frame);
+        return;
+      }
+    } else if (len > 0) {
+      for (int i = 0; i < len; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(text[i]);
+        if (std::isprint(ch) != 0) {
+          active_buffer.push_back(static_cast<char>(ch));
+        }
+      }
+    }
+    draw_internal_content(client);
   } else if (client.internal_kind == InternalKind::Preferences) {
     const KeySym sym = XLookupKeysym(const_cast<XKeyEvent*>(&event), 0);
     if (sym == XK_Escape) {
@@ -1931,6 +2545,8 @@ void WindowManager::manage_window(Window window) {
     stored.internal_kind = InternalKind::Execute;
   } else if (window == file_manager_window_) {
     stored.internal_kind = InternalKind::Browser;
+  } else if (window == applications_window_) {
+    stored.internal_kind = InternalKind::Applications;
   } else if (window == preferences_window_) {
     stored.internal_kind = InternalKind::Preferences;
   } else if (window == about_window_) {
@@ -1999,6 +2615,15 @@ void WindowManager::unmanage_window(Window window, bool withdraw) {
     file_manager_window_ = 0;
     file_manager_entries_.clear();
     file_manager_selected_ = 0;
+  }
+  if (client.window == applications_window_) {
+    applications_window_ = 0;
+    application_name_buffer_.clear();
+    application_command_buffer_.clear();
+    applications_selected_.reset();
+    applications_drag_index_.reset();
+    applications_drag_moved_ = false;
+    applications_active_field_ = ApplicationsField::Name;
   }
   if (client.window == preferences_window_) {
     preferences_window_ = 0;
@@ -2351,6 +2976,19 @@ void WindowManager::save_config() {
     icons.push_back({icon.label, icon.command, icon.x, icon.y});
   }
   config_.desktop_icons = std::move(icons);
+  {
+    std::unordered_set<std::string> seen_apps;
+    std::vector<config::ApplicationEntry> unique_apps;
+    unique_apps.reserve(config_.applications.size());
+    for (const auto& entry : config_.applications) {
+      const std::string key = entry.label + "\x1f" + entry.command;
+      if (!seen_apps.insert(key).second) {
+        continue;
+      }
+      unique_apps.push_back(entry);
+    }
+    config_.applications = std::move(unique_apps);
+  }
   try {
     config_.save(config_path_);
   } catch (const std::exception& e) {
@@ -2515,6 +3153,7 @@ void WindowManager::show_menu(ui::MenuId menu, int x, int y) {
     case ui::MenuId::Apple:
       items = {
           {"About chiux", "about"},
+          {"Applications", "open-applications"},
           {"Preferences", "open-preferences"},
           {"Terminal", "launch-terminal"},
           {"File Browser", "launch-browser"},
@@ -2600,6 +3239,8 @@ void WindowManager::hide_menu() {
 void WindowManager::handle_menu_action(const std::string& action) {
   if (action == "about") {
     open_about_window();
+  } else if (action == "open-applications") {
+    open_applications_window();
   } else if (action == "open-preferences") {
     open_preferences_window();
   } else if (action == "launch-terminal") {
@@ -2610,6 +3251,8 @@ void WindowManager::handle_menu_action(const std::string& action) {
     open_file_manager_window();
   } else if (action == "open-file-manager") {
     open_file_manager_window();
+  } else if (action == "open-applications-window") {
+    open_applications_window();
   } else if (action == "open-execute") {
     open_execute_window();
   } else if (action == "open-config") {

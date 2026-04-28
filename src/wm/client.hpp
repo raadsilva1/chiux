@@ -10,6 +10,7 @@ enum class InternalKind {
   Unset,
   Execute,
   Browser,
+  Applications,
   Preferences,
   About,
   Home,
