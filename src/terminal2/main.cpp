@@ -264,6 +264,20 @@ std::string trim_osc_value(std::string value) {
   return value;
 }
 
+std::string normalized_window_title(std::string value, const std::string& fallback) {
+  value = trim_osc_value(std::move(value));
+  const auto is_meaningful = [](unsigned char ch) {
+    return std::isprint(ch) != 0 && !std::isspace(ch);
+  };
+  const bool meaningful = std::any_of(value.begin(), value.end(), [&](char ch) {
+    return is_meaningful(static_cast<unsigned char>(ch));
+  });
+  if (!meaningful) {
+    return fallback;
+  }
+  return value;
+}
+
 std::string base64_decode(const std::string& input) {
   auto decode_char = [](char ch) -> int {
     if (ch >= 'A' && ch <= 'Z') return ch - 'A';
@@ -1490,64 +1504,19 @@ private:
       return;
     }
     if (final == 'u') {
+      // Report no kitty keyboard enhancements and ignore enable/disable requests.
+      // The clone emits legacy xterm key sequences; advertising partial CSI-u support
+      // breaks TUIs such as vi/vim that then expect enhanced keyboard encoding.
       if (is_private) {
-        std::ostringstream out;
-        out << "\x1b[?" << keyboard_flags_ << 'u';
-        const std::string reply = out.str();
-        send_bytes(reply.data(), reply.size());
-        csi_private_ = false;
-        csi_secondary_ = false;
-        csi_pop_ = false;
-        csi_equals_ = false;
-        return;
+        send_bytes("\x1b[?0u", 6);
       }
-      if (is_secondary) {
-        const unsigned int flags = static_cast<unsigned int>(std::max(0, param_or(0, 0)));
-        keyboard_mode_stack_.push_back(keyboard_flags_);
-        if (keyboard_mode_stack_.size() > 16) {
-          keyboard_mode_stack_.erase(keyboard_mode_stack_.begin());
-        }
-        keyboard_flags_ = flags;
-        csi_private_ = false;
-        csi_secondary_ = false;
-        csi_pop_ = false;
-        csi_equals_ = false;
-        return;
-      }
-      if (is_pop) {
-        unsigned int count = static_cast<unsigned int>(std::max(1, param_or(0, 1)));
-        bool emptied = keyboard_mode_stack_.empty();
-        while (count > 0 && !keyboard_mode_stack_.empty()) {
-          keyboard_flags_ = keyboard_mode_stack_.back();
-          keyboard_mode_stack_.pop_back();
-          --count;
-          emptied = keyboard_mode_stack_.empty();
-        }
-        if (count > 0 && emptied) {
-          keyboard_flags_ = 0;
-        }
-        csi_private_ = false;
-        csi_secondary_ = false;
-        csi_pop_ = false;
-        csi_equals_ = false;
-        return;
-      }
-      if (is_equals) {
-        const unsigned int flags = static_cast<unsigned int>(std::max(0, param_or(0, 0)));
-        const int mode = param_or(1, 1);
-        if (mode == 1) {
-          keyboard_flags_ = flags;
-        } else if (mode == 2) {
-          keyboard_flags_ |= flags;
-        } else if (mode == 3) {
-          keyboard_flags_ &= ~flags;
-        }
-        csi_private_ = false;
-        csi_secondary_ = false;
-        csi_pop_ = false;
-        csi_equals_ = false;
-        return;
-      }
+      keyboard_flags_ = 0;
+      keyboard_mode_stack_.clear();
+      csi_private_ = false;
+      csi_secondary_ = false;
+      csi_pop_ = false;
+      csi_equals_ = false;
+      return;
     }
     if (is_secondary) {
       csi_secondary_ = false;
@@ -1899,7 +1868,7 @@ private:
       }
     }
     if (command == 0 || command == 1 || command == 2) {
-      const std::string value = trim_osc_value(rest);
+      const std::string value = normalized_window_title(rest, "chiux-te-2");
       if (command == 0 || command == 2) {
         XStoreName(display_, window_, value.c_str());
       }
@@ -1938,6 +1907,9 @@ private:
       return;
     }
     if (enable) {
+      clear_completion_state();
+      editor_.text.clear();
+      editor_.cursor = 0;
       alternate_screen_state_.cells = cells_;
       alternate_screen_state_.cursor_x = cursor_x_;
       alternate_screen_state_.cursor_y = cursor_y_;
@@ -1990,6 +1962,9 @@ private:
       use_g1_charset_ = alternate_screen_state_.use_g1_charset;
       alternate_screen_state_.active = false;
       reset_scroll_region();
+      clear_completion_state();
+      editor_.text.clear();
+      editor_.cursor = 0;
     }
     alternate_screen_active_ = enable;
     redraw();
@@ -2903,10 +2878,10 @@ private:
     const int title_x = std::max(64, static_cast<int>(width_) - title_width - 10);
 
     std::string status_text;
-    if (completion_popup_open_ && !completion_items_.empty()) {
+    if (!alternate_screen_active_ && completion_popup_open_ && !completion_items_.empty()) {
       const auto& item = completion_items_[completion_index_ % completion_items_.size()];
       status_text = "Tab: " + item.label;
-    } else if (!history_hint_.empty()) {
+    } else if (!alternate_screen_active_ && !history_hint_.empty()) {
       status_text = "Hist: " + history_hint_;
     }
     if (!status_text.empty()) {
@@ -3322,19 +3297,20 @@ private:
     KeySym sym = NoSymbol;
     char buffer[64] = {};
     const int length = XLookupString(const_cast<XKeyEvent*>(&event), buffer, sizeof(buffer), &sym, nullptr);
+    const bool tui_mode = alternate_screen_active_;
 
     if (scrollback_offset_ != 0) {
       scrollback_offset_ = 0;
       redraw();
     }
 
-    if (completion_popup_open_ && sym == XK_Escape) {
+    if (!tui_mode && completion_popup_open_ && sym == XK_Escape) {
       clear_completion_state();
       redraw();
       return;
     }
 
-    if (completion_popup_open_ && sym == XK_Tab) {
+    if (!tui_mode && completion_popup_open_ && sym == XK_Tab) {
       if (!completion_items_.empty()) {
         completion_index_ = (completion_index_ + 1) % completion_items_.size();
         redraw();
@@ -3342,7 +3318,7 @@ private:
       }
     }
 
-    if (completion_popup_open_ && (sym == XK_Return || sym == XK_KP_Enter)) {
+    if (!tui_mode && completion_popup_open_ && (sym == XK_Return || sym == XK_KP_Enter)) {
       accept_completion();
       commit_current_line_history();
       send_bytes("\r", 1);
@@ -3372,6 +3348,12 @@ private:
     }
 
     if ((event.state & ControlMask) != 0 && (event.state & ShiftMask) == 0) {
+      if (tui_mode) {
+        if (length > 0) {
+          send_bytes(buffer, static_cast<std::size_t>(length));
+          return;
+        }
+      }
       switch (sym) {
         case XK_A:
         case XK_a:
@@ -3427,26 +3409,48 @@ private:
     };
 
     auto send_cursor_sequence = [&](const char* normal, const char* application) {
-      const char* seq = application_cursor_keys_ ? application : normal;
+      const bool application_mode = tui_mode || application_cursor_keys_ || application_keypad_mode_;
+      const char* seq = application_mode ? application : normal;
       send_bytes(seq, std::strlen(seq));
     };
 
-    if ((event.state & Mod1Mask) != 0 && length > 0) {
+    const bool special_keysym =
+        sym == XK_Return || sym == XK_KP_Enter ||
+        sym == XK_BackSpace || sym == XK_Tab || sym == XK_Escape ||
+        sym == XK_Left || sym == XK_KP_Left ||
+        sym == XK_Right || sym == XK_KP_Right ||
+        sym == XK_Up || sym == XK_KP_Up ||
+        sym == XK_Down || sym == XK_KP_Down ||
+        sym == XK_Home || sym == XK_KP_Home ||
+        sym == XK_End || sym == XK_KP_End ||
+        sym == XK_Delete || sym == XK_KP_Delete ||
+        sym == XK_Page_Up || sym == XK_KP_Page_Up ||
+        sym == XK_Page_Down || sym == XK_KP_Page_Down;
+
+    if ((event.state & Mod1Mask) != 0 && length > 0 && !special_keysym) {
       send_char('\x1b');
       send_bytes(buffer, static_cast<std::size_t>(length));
-      clear_completion_state();
-      redraw();
+      if (!tui_mode) {
+        clear_completion_state();
+        redraw();
+      }
       return;
     }
 
-    if ((event.state & ControlMask) != 0 && length > 0) {
+    if ((event.state & ControlMask) != 0 && length > 0 && !special_keysym) {
       send_bytes(buffer, static_cast<std::size_t>(length));
-      clear_completion_state();
-      redraw();
+      if (!tui_mode) {
+        clear_completion_state();
+        redraw();
+      }
       return;
     }
 
-    if (length > 0) {
+    if (length > 0 && !special_keysym) {
+      if (tui_mode) {
+        send_bytes(buffer, static_cast<std::size_t>(length));
+        return;
+      }
       insert_text_at_cursor(std::string(buffer, static_cast<std::size_t>(length)));
       return;
     }
@@ -3454,21 +3458,33 @@ private:
     switch (sym) {
       case XK_Return:
       case XK_KP_Enter:
-        commit_current_line_history();
+        if (!tui_mode) {
+          commit_current_line_history();
+        }
         if (application_keypad_mode_ && sym == XK_KP_Enter) {
           send_bytes("\x1bOM", 3);
         } else {
           send_char('\r');
         }
-        editor_.text.clear();
-        editor_.cursor = 0;
-        clear_completion_state();
+        if (!tui_mode) {
+          editor_.text.clear();
+          editor_.cursor = 0;
+          clear_completion_state();
+        }
         break;
       case XK_BackSpace:
-        erase_previous_character();
+        if (tui_mode) {
+          send_bytes("\b", 1);
+        } else {
+          erase_previous_character();
+        }
         break;
       case XK_Tab:
         {
+        if (tui_mode) {
+          send_char('\t');
+          break;
+        }
           const bool was_open = completion_popup_open_;
         refresh_completion_state();
         if (completion_popup_open_ && !completion_items_.empty()) {
@@ -3483,69 +3499,103 @@ private:
         break;
       case XK_Escape:
         send_char('\x1b');
-        clear_completion_state();
+        if (!tui_mode) {
+          clear_completion_state();
+        }
         break;
       case XK_Left:
-        move_cursor_left();
+        if (!tui_mode) {
+          move_cursor_left();
+        }
         send_cursor_sequence("\x1b[D", "\x1bOD");
         break;
       case XK_KP_Left:
-        move_cursor_left();
+        if (!tui_mode) {
+          move_cursor_left();
+        }
         send_cursor_sequence("\x1b[D", "\x1bOD");
         break;
       case XK_Right:
-        move_cursor_right();
+        if (!tui_mode) {
+          move_cursor_right();
+        }
         send_cursor_sequence("\x1b[C", "\x1bOC");
         break;
       case XK_KP_Right:
-        move_cursor_right();
+        if (!tui_mode) {
+          move_cursor_right();
+        }
         send_cursor_sequence("\x1b[C", "\x1bOC");
         break;
       case XK_Up:
-        clear_completion_state();
-        editor_.text.clear();
-        editor_.cursor = 0;
+        if (!tui_mode) {
+          clear_completion_state();
+          editor_.text.clear();
+          editor_.cursor = 0;
+        }
         send_cursor_sequence("\x1b[A", "\x1bOA");
         break;
       case XK_KP_Up:
-        clear_completion_state();
-        editor_.text.clear();
-        editor_.cursor = 0;
+        if (!tui_mode) {
+          clear_completion_state();
+          editor_.text.clear();
+          editor_.cursor = 0;
+        }
         send_cursor_sequence("\x1b[A", "\x1bOA");
         break;
       case XK_Down:
-        clear_completion_state();
-        editor_.text.clear();
-        editor_.cursor = 0;
+        if (!tui_mode) {
+          clear_completion_state();
+          editor_.text.clear();
+          editor_.cursor = 0;
+        }
         send_cursor_sequence("\x1b[B", "\x1bOB");
         break;
       case XK_KP_Down:
-        clear_completion_state();
-        editor_.text.clear();
-        editor_.cursor = 0;
+        if (!tui_mode) {
+          clear_completion_state();
+          editor_.text.clear();
+          editor_.cursor = 0;
+        }
         send_cursor_sequence("\x1b[B", "\x1bOB");
         break;
       case XK_Home:
-        move_cursor_home();
+        if (!tui_mode) {
+          move_cursor_home();
+        }
         send_cursor_sequence("\x1b[H", "\x1bOH");
         break;
       case XK_KP_Home:
-        move_cursor_home();
+        if (!tui_mode) {
+          move_cursor_home();
+        }
         send_cursor_sequence("\x1b[H", "\x1bOH");
         break;
       case XK_End:
-        move_cursor_end();
+        if (!tui_mode) {
+          move_cursor_end();
+        }
         send_cursor_sequence("\x1b[F", "\x1bOF");
         break;
       case XK_KP_End:
-        move_cursor_end();
+        if (!tui_mode) {
+          move_cursor_end();
+        }
         send_cursor_sequence("\x1b[F", "\x1bOF");
         break;
       case XK_Delete:
-        erase_next_character();
+        if (tui_mode) {
+          send_bytes("\x1b[3~", 4);
+        } else {
+          erase_next_character();
+        }
         break;
       case XK_KP_Delete:
-        erase_next_character();
+        if (tui_mode) {
+          send_bytes("\x1b[3~", 4);
+        } else {
+          erase_next_character();
+        }
         break;
       case XK_Page_Up:
         send_bytes("\x1b[5~", 4);
@@ -3562,7 +3612,9 @@ private:
       default:
         break;
     }
-    refresh_completion_state();
+    if (!tui_mode) {
+      refresh_completion_state();
+    }
   }
 
   void reset_screen() {
