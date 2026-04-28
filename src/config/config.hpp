@@ -6,6 +6,8 @@
 
 namespace chiux::config {
 
+inline constexpr unsigned int kTerminalFeelThemeCount = 108u;
+
 struct Launcher {
   std::string label;
   std::string command;
@@ -34,6 +36,7 @@ struct Config {
   unsigned long menu_text_pixel = 0x000000;
   bool resolve_terminal_binary = true;
   std::string terminal_command = "terminator";
+  unsigned int terminal_feel = 0;
   std::string file_browser_command = "chiux:open-file-manager";
   std::vector<Launcher> launchers;
   std::vector<DesktopIcon> desktop_icons;

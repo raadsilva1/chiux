@@ -16,14 +16,16 @@ INSTALL_BINDIR := $(DESTDIR)$(PREFIX)/bin
 INSTALL_DATADIR := $(DESTDIR)$(PREFIX)/share/chiux
 INSTALL_RESOURCEDIR := $(INSTALL_DATADIR)/res
 
-.PHONY: all configure build run install install-files bootstrap clean distclean help
+.PHONY: all configure build run run-terminal2 install install-files bootstrap clean distclean help
 
 all: build
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
-		'  make build       - configure and build chiux + chiux-te' \
+		'  make build       - configure and build chiux + chiux-te + chiux-te-2' \
+		'  make run         - run chiux from the build tree' \
+		'  make run-terminal2 - run chiux-te-2 from the build tree' \
 		'  make install     - build, install, and bootstrap ~/.config/chiux/config.ini if missing' \
 		'  make bootstrap   - alias for make install' \
 		'  make clean       - clean the CMake build tree' \
@@ -40,12 +42,16 @@ build: configure
 run: build
 	@exec "$(BUILD_DIR)/chiux"
 
+run-terminal2: build
+	@exec "$(BUILD_DIR)/chiux-te-2"
+
 install: build install-files bootstrap-config
 
 install-files:
 	@install -d "$(INSTALL_BINDIR)" "$(INSTALL_RESOURCEDIR)"
 	@install -m 755 "$(BUILD_DIR)/chiux" "$(INSTALL_BINDIR)/chiux"
 	@install -m 755 "$(BUILD_DIR)/chiux-te" "$(INSTALL_BINDIR)/chiux-te"
+	@install -m 755 "$(BUILD_DIR)/chiux-te-2" "$(INSTALL_BINDIR)/chiux-te-2"
 	@install -m 644 "res/chimera.png" "$(INSTALL_RESOURCEDIR)/chimera.png"
 	@install -m 644 "res/config.ini" "$(INSTALL_DATADIR)/config.ini.example"
 

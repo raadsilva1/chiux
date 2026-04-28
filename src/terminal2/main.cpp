@@ -3,6 +3,8 @@
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/Xlocale.h>
+#include <X11/Xft/Xft.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
@@ -20,6 +22,7 @@
 #include <deque>
 #include <filesystem>
 #include <cwchar>
+#include <iomanip>
 #include <optional>
 #include <pty.h>
 #include <signal.h>
@@ -32,6 +35,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace chiux::te {
@@ -44,6 +48,7 @@ struct Cell {
   unsigned long bg = 0;
   bool bold = false;
   bool inverse = false;
+  bool underlined = false;
   bool continuation = false;
 };
 
@@ -102,6 +107,60 @@ XFontStruct* load_font(Display* display, unsigned int* ascent, unsigned int* des
     *descent = static_cast<unsigned int>(std::max(1, font->descent));
     *cell_w = static_cast<unsigned int>(std::max(1, static_cast<int>(font->max_bounds.width)));
     *cell_h = static_cast<unsigned int>(std::max(1, font->ascent + font->descent));
+  }
+  return font;
+}
+
+XFontSet load_font_set(Display* display) {
+  static XFontSet fontset = nullptr;
+  static bool attempted = false;
+  if (attempted) {
+    return fontset;
+  }
+  attempted = true;
+
+  static const char* candidates[] = {
+      "monospace",
+      "DejaVu Sans Mono",
+      "Noto Sans Mono",
+      "Liberation Mono",
+      "Source Code Pro",
+      "fixed",
+  };
+  for (const char* candidate : candidates) {
+    char** missing = nullptr;
+    int missing_count = 0;
+    char* def_string = nullptr;
+    fontset = XCreateFontSet(display, candidate, &missing, &missing_count, &def_string);
+    if (fontset) {
+      chiux::log::info(std::string("chiux-te-2 fontset loaded: ") + candidate);
+      break;
+    }
+  }
+  return fontset;
+}
+
+XftFont* load_xft_font(Display* display, int screen) {
+  static XftFont* font = nullptr;
+  static bool attempted = false;
+  if (attempted) {
+    return font;
+  }
+  attempted = true;
+
+  static const char* candidates[] = {
+      "DejaVu Sans Mono:pixelsize=12:antialias=true",
+      "DejaVu Sans Mono:pixelsize=13:antialias=true",
+      "Noto Sans Mono:pixelsize=12:antialias=true",
+      "Liberation Mono:pixelsize=12:antialias=true",
+      "monospace:pixelsize=12:antialias=true",
+  };
+  for (const char* candidate : candidates) {
+    font = XftFontOpenName(display, screen, candidate);
+    if (font) {
+      chiux::log::info(std::string("chiux-te-2 xft font loaded: ") + candidate);
+      break;
+    }
   }
   return font;
 }
@@ -198,11 +257,214 @@ unsigned int utf8_display_width(char32_t codepoint) {
   return static_cast<unsigned int>(width);
 }
 
+std::string trim_osc_value(std::string value) {
+  while (!value.empty() && (value.back() == '\0' || value.back() == '\n' || value.back() == '\r')) {
+    value.pop_back();
+  }
+  return value;
+}
+
+std::string base64_decode(const std::string& input) {
+  auto decode_char = [](char ch) -> int {
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+') return 62;
+    if (ch == '/') return 63;
+    return -1;
+  };
+
+  std::string output;
+  int value = 0;
+  int bits = -8;
+  for (char ch : input) {
+    if (ch == '=') {
+      break;
+    }
+    const int decoded = decode_char(ch);
+    if (decoded < 0) {
+      continue;
+    }
+    value = (value << 6) | decoded;
+    bits += 6;
+    if (bits >= 0) {
+      output.push_back(static_cast<char>((value >> bits) & 0xFF));
+      bits -= 8;
+    }
+  }
+  return output;
+}
+
 struct Rgb {
   unsigned int r = 0;
   unsigned int g = 0;
   unsigned int b = 0;
 };
+
+struct CachedColor {
+  Rgb rgb{};
+  unsigned int luma = 0;
+  bool ready = false;
+};
+
+std::optional<Rgb> parse_rgb_spec(std::string value) {
+  value = trim_osc_value(std::move(value));
+  if (value.rfind("rgb:", 0) == 0) {
+    value = value.substr(4);
+    std::array<unsigned int, 3> components{};
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < components.size(); ++i) {
+      const std::size_t end = value.find('/', start);
+      const std::string part = value.substr(start, end == std::string::npos ? std::string::npos : end - start);
+      if (part.empty() || part.size() > 4) {
+        return std::nullopt;
+      }
+      unsigned int parsed = 0;
+      for (char ch : part) {
+        parsed <<= 4;
+        if (ch >= '0' && ch <= '9') parsed += static_cast<unsigned int>(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') parsed += static_cast<unsigned int>(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') parsed += static_cast<unsigned int>(ch - 'A' + 10);
+        else return std::nullopt;
+      }
+      if (part.size() == 1) {
+        parsed = parsed * 0x1111u;
+      } else if (part.size() == 2) {
+        parsed = parsed * 0x0101u;
+      } else if (part.size() == 3) {
+        parsed = (parsed << 4) | (parsed >> 8);
+      }
+      components[i] = parsed;
+      if (end == std::string::npos) {
+        if (i != 2) {
+          return std::nullopt;
+        }
+      } else {
+        start = end + 1;
+      }
+    }
+    return Rgb{
+        static_cast<unsigned int>(components[0] / 257u),
+        static_cast<unsigned int>(components[1] / 257u),
+        static_cast<unsigned int>(components[2] / 257u),
+    };
+  }
+  if (!value.empty() && value[0] == '#') {
+    value = value.substr(1);
+    if (value.size() != 6 && value.size() != 12) {
+      return std::nullopt;
+    }
+    auto parse_hex = [](const std::string& s) -> unsigned int {
+      unsigned int v = 0;
+      for (char ch : s) {
+        v <<= 4;
+        if (ch >= '0' && ch <= '9') v += static_cast<unsigned int>(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') v += static_cast<unsigned int>(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') v += static_cast<unsigned int>(ch - 'A' + 10);
+        else return 0;
+      }
+      return v;
+    };
+    if (value.size() == 6) {
+      return Rgb{
+          parse_hex(value.substr(0, 2)),
+          parse_hex(value.substr(2, 2)),
+          parse_hex(value.substr(4, 2)),
+      };
+    }
+    return Rgb{
+        parse_hex(value.substr(0, 4)) / 257u,
+        parse_hex(value.substr(4, 4)) / 257u,
+        parse_hex(value.substr(8, 4)) / 257u,
+    };
+  }
+  return std::nullopt;
+}
+
+std::string rgb_spec_reply(const Rgb& rgb, int command) {
+  auto hex4 = [](unsigned int component) {
+    std::ostringstream out;
+    out << std::hex << std::nouppercase << std::setfill('0') << std::setw(4) << (component * 257u);
+    return out.str();
+  };
+  std::ostringstream out;
+  out << "\x1b]" << command << ";rgb:" << hex4(rgb.r) << '/' << hex4(rgb.g) << '/' << hex4(rgb.b) << "\x07";
+  return out.str();
+}
+
+std::vector<int> parse_sgr_params(const std::string& raw) {
+  std::vector<int> params;
+  if (raw.empty()) {
+    return params;
+  }
+
+  std::size_t start = 0;
+  while (start <= raw.size()) {
+    const std::size_t end = raw.find(';', start);
+    const std::string group = raw.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (group.empty()) {
+      params.push_back(0);
+    } else {
+      std::size_t sub_start = 0;
+      bool pushed = false;
+      while (sub_start <= group.size()) {
+        const std::size_t sub_end = group.find(':', sub_start);
+        const std::string token = group.substr(sub_start, sub_end == std::string::npos ? std::string::npos : sub_end - sub_start);
+        if (!token.empty()) {
+          params.push_back(std::atoi(token.c_str()));
+          pushed = true;
+        }
+        if (sub_end == std::string::npos) {
+          break;
+        }
+        sub_start = sub_end + 1;
+      }
+      if (!pushed) {
+        params.push_back(0);
+      }
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  return params;
+}
+
+Rgb pixel_to_rgb(Display* display, int screen, unsigned long pixel) {
+  XColor color{};
+  color.pixel = pixel;
+  XQueryColor(display, DefaultColormap(display, screen), &color);
+  return {
+      static_cast<unsigned int>(color.red / 257u),
+      static_cast<unsigned int>(color.green / 257u),
+      static_cast<unsigned int>(color.blue / 257u),
+  };
+}
+
+std::optional<char32_t> utf8_single_codepoint(const std::string& text) {
+  char32_t codepoint = 0;
+  if (utf8_decode(text, codepoint)) {
+    return codepoint;
+  }
+  return std::nullopt;
+}
+
+Rgb shift_contrast_rgb(const Rgb& rgb, bool lighten, unsigned int amount) {
+  amount = std::min(amount, 100u);
+  if (lighten) {
+    return {
+        static_cast<unsigned int>(rgb.r + ((255u - rgb.r) * amount) / 100u),
+        static_cast<unsigned int>(rgb.g + ((255u - rgb.g) * amount) / 100u),
+        static_cast<unsigned int>(rgb.b + ((255u - rgb.b) * amount) / 100u),
+    };
+  }
+  return {
+      static_cast<unsigned int>((rgb.r * (100u - amount)) / 100u),
+      static_cast<unsigned int>((rgb.g * (100u - amount)) / 100u),
+      static_cast<unsigned int>((rgb.b * (100u - amount)) / 100u),
+  };
+}
 
 struct FeelTheme {
   std::string name;
@@ -649,8 +911,23 @@ public:
     if (master_fd_ >= 0) {
       close(master_fd_);
     }
+    if (display_) {
+      for (auto& [pixel, color] : xft_color_cache_) {
+        XftColorFree(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &color);
+      }
+      xft_color_cache_.clear();
+    }
     if (backing_) {
       XFreePixmap(display_, backing_);
+    }
+    if (xft_draw_) {
+      XftDrawDestroy(xft_draw_);
+    }
+    if (xft_font_) {
+      XftFontClose(display_, xft_font_);
+    }
+    if (fontset_) {
+      XFreeFontSet(display_, fontset_);
     }
     if (font_) {
       XFreeFont(display_, font_);
@@ -707,7 +984,7 @@ public:
         if (errno == EINTR) {
           continue;
         }
-        throw std::runtime_error(std::string("chiux-te select failed: ") + std::strerror(errno));
+        throw std::runtime_error(std::string("chiux-te-2 select failed: ") + std::strerror(errno));
       }
       if (ready > 0) {
         if (FD_ISSET(master_fd_, &readfds)) {
@@ -750,7 +1027,7 @@ private:
         break;
       }
       if (arg == "-h" || arg == "--help") {
-        throw std::runtime_error("usage: chiux-te [-e command]");
+        throw std::runtime_error("usage: chiux-te-2 [-e command]");
       }
     }
   }
@@ -791,6 +1068,8 @@ private:
 
   void load_resources() {
     font_ = load_font(display_, &ascent_, &descent_, &cell_w_, &cell_h_);
+    fontset_ = load_font_set(display_);
+    xft_font_ = load_xft_font(display_, screen_);
     if (!font_) {
       cell_w_ = 8;
       cell_h_ = 16;
@@ -798,7 +1077,7 @@ private:
       descent_ = 4;
     } else {
       if (cell_w_ > 8 || cell_h_ > 16 || ascent_ > 12) {
-        chiux::log::warn("chiux-te font metrics too large; forcing fixed cell size");
+        chiux::log::warn("chiux-te-2 font metrics too large; forcing fixed cell size");
         cell_w_ = 8;
         cell_h_ = 16;
         ascent_ = 12;
@@ -822,9 +1101,15 @@ private:
     palette_[13] = rgb_pixel(display_, screen_, 176, 122, 176);
     palette_[14] = rgb_pixel(display_, screen_, 108, 176, 176);
     palette_[15] = rgb_pixel(display_, screen_, 255, 255, 255);
+    for (std::size_t i = 0; i < default_palette_.size(); ++i) {
+      default_palette_[i] = palette_[i];
+    }
     apply_theme_to_pixels(feel_theme_);
     for (unsigned int i = 0; i < 256; ++i) {
       color_table_[i] = xterm_256_pixel(display_, screen_, i);
+    }
+    for (std::size_t i = 0; i < default_color_table_.size(); ++i) {
+      default_color_table_[i] = color_table_[i];
     }
   }
 
@@ -838,11 +1123,18 @@ private:
     window_ = XCreateWindow(display_, RootWindow(display_, screen_), 0, 0, width, height, 0,
                             CopyFromParent, InputOutput, CopyFromParent,
                             CWBackPixel | CWEventMask, &attrs);
-    XStoreName(display_, window_, "chiux-te");
+    XStoreName(display_, window_, "chiux-te-2");
     XClassHint class_hint{};
-    class_hint.res_name = const_cast<char*>("chiux-te");
+    class_hint.res_name = const_cast<char*>("chiux-te-2");
     class_hint.res_class = const_cast<char*>("ChiuxTe");
     XSetClassHint(display_, window_, &class_hint);
+    XSizeHints size_hints{};
+    size_hints.flags = PMinSize | PBaseSize;
+    size_hints.min_width = 320;
+    size_hints.min_height = 200;
+    size_hints.base_width = 320;
+    size_hints.base_height = 200;
+    XSetWMNormalHints(display_, window_, &size_hints);
 
     wm_protocols_ = XInternAtom(display_, "WM_PROTOCOLS", False);
     wm_delete_window_ = XInternAtom(display_, "WM_DELETE_WINDOW", False);
@@ -885,6 +1177,7 @@ private:
     scrollback_offset_ = 0;
     cursor_x_ = std::min(cursor_x_, static_cast<int>(cols_ - 1));
     cursor_y_ = std::min(cursor_y_, static_cast<int>(rows_ - 1));
+    reset_scroll_region();
     recreate_backing();
     notify_child_winsize();
     redraw();
@@ -896,6 +1189,11 @@ private:
       backing_ = 0;
     }
     backing_ = XCreatePixmap(display_, window_, width_, height_, static_cast<unsigned int>(DefaultDepth(display_, screen_)));
+    if (xft_draw_) {
+      XftDrawChange(xft_draw_, backing_);
+    } else {
+      xft_draw_ = XftDrawCreate(display_, backing_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_));
+    }
   }
 
   void notify_child_winsize() {
@@ -947,7 +1245,8 @@ private:
       }
       setenv("TERM", "xterm-256color", 1);
       setenv("COLORTERM", "truecolor", 1);
-      setenv("TERM_PROGRAM", "chiux-te", 1);
+      setenv("TERM_PROGRAM", "chiux-te-2", 1);
+      setenv("TERMINFO", "/usr/share/terminfo", 1);
       if (!exec_command_.empty()) {
         execl("/bin/bash", "bash", "-lc", exec_command_.c_str(), static_cast<char*>(nullptr));
       } else {
@@ -961,6 +1260,7 @@ private:
     if (flags >= 0) {
       fcntl(master_fd_, F_SETFL, flags | O_NONBLOCK);
     }
+    notify_child_winsize();
   }
 
   void terminate_child() {
@@ -987,7 +1287,7 @@ private:
       return true;
     }
     if (errno != ECHILD) {
-      chiux::log::warn(std::string("chiux-te waitpid failed: ") + std::strerror(errno));
+      chiux::log::warn(std::string("chiux-te-2 waitpid failed: ") + std::strerror(errno));
     }
     running_ = false;
     return true;
@@ -1061,12 +1361,22 @@ private:
           csi_current_ = 0;
           csi_have_value_ = false;
           csi_private_ = false;
+          csi_secondary_ = false;
+          csi_pop_ = false;
+          csi_equals_ = false;
+          csi_raw_.clear();
         } else if (ch == '(') {
           state_ = ParseState::Charset;
           charset_target_g1_ = false;
         } else if (ch == ')') {
           state_ = ParseState::Charset;
           charset_target_g1_ = true;
+        } else if (ch == '=') {
+          application_keypad_mode_ = true;
+          state_ = ParseState::Ground;
+        } else if (ch == '>') {
+          application_keypad_mode_ = false;
+          state_ = ParseState::Ground;
         } else if (ch == ']') {
           state_ = ParseState::Osc;
           osc_buffer_.clear();
@@ -1108,19 +1418,34 @@ private:
       case ParseState::Csi:
         if (ch == '?') {
           csi_private_ = true;
+        } else if (ch == '>') {
+          csi_secondary_ = true;
+        } else if (ch == '<') {
+          csi_pop_ = true;
+        } else if (ch == '=') {
+          csi_equals_ = true;
+        } else if (ch == ':' || ch == ';') {
+          csi_raw_.push_back(static_cast<char>(ch));
+          if (ch == ';') {
+            csi_params_.push_back(csi_have_value_ ? csi_current_ : -1);
+            csi_current_ = 0;
+            csi_have_value_ = false;
+          }
         } else if (ch >= '0' && ch <= '9') {
+          csi_raw_.push_back(static_cast<char>(ch));
           csi_current_ = csi_current_ * 10 + (ch - '0');
           csi_have_value_ = true;
-        } else if (ch == ';') {
-          csi_params_.push_back(csi_have_value_ ? csi_current_ : -1);
-          csi_current_ = 0;
-          csi_have_value_ = false;
         } else {
           if (csi_have_value_ || csi_params_.empty()) {
             csi_params_.push_back(csi_have_value_ ? csi_current_ : -1);
           }
-          apply_csi(ch);
+          if (ch == 'm') {
+            apply_sgr_raw(csi_raw_);
+          } else {
+            apply_csi(ch);
+          }
           state_ = ParseState::Ground;
+          csi_raw_.clear();
         }
         break;
       case ParseState::Osc:
@@ -1151,13 +1476,105 @@ private:
       }
       return csi_params_[index];
     };
+    const bool is_private = csi_private_;
+    const bool is_secondary = csi_secondary_;
+    const bool is_pop = csi_pop_;
+    const bool is_equals = csi_equals_;
 
-    if (csi_private_ && (final == 'h' || final == 'l')) {
+    if (is_secondary && final == 'c') {
+      send_bytes("\x1b[>0;136;0c", 11);
+      csi_secondary_ = false;
+      csi_private_ = false;
+      csi_pop_ = false;
+      csi_equals_ = false;
+      return;
+    }
+    if (final == 'u') {
+      if (is_private) {
+        std::ostringstream out;
+        out << "\x1b[?" << keyboard_flags_ << 'u';
+        const std::string reply = out.str();
+        send_bytes(reply.data(), reply.size());
+        csi_private_ = false;
+        csi_secondary_ = false;
+        csi_pop_ = false;
+        csi_equals_ = false;
+        return;
+      }
+      if (is_secondary) {
+        const unsigned int flags = static_cast<unsigned int>(std::max(0, param_or(0, 0)));
+        keyboard_mode_stack_.push_back(keyboard_flags_);
+        if (keyboard_mode_stack_.size() > 16) {
+          keyboard_mode_stack_.erase(keyboard_mode_stack_.begin());
+        }
+        keyboard_flags_ = flags;
+        csi_private_ = false;
+        csi_secondary_ = false;
+        csi_pop_ = false;
+        csi_equals_ = false;
+        return;
+      }
+      if (is_pop) {
+        unsigned int count = static_cast<unsigned int>(std::max(1, param_or(0, 1)));
+        bool emptied = keyboard_mode_stack_.empty();
+        while (count > 0 && !keyboard_mode_stack_.empty()) {
+          keyboard_flags_ = keyboard_mode_stack_.back();
+          keyboard_mode_stack_.pop_back();
+          --count;
+          emptied = keyboard_mode_stack_.empty();
+        }
+        if (count > 0 && emptied) {
+          keyboard_flags_ = 0;
+        }
+        csi_private_ = false;
+        csi_secondary_ = false;
+        csi_pop_ = false;
+        csi_equals_ = false;
+        return;
+      }
+      if (is_equals) {
+        const unsigned int flags = static_cast<unsigned int>(std::max(0, param_or(0, 0)));
+        const int mode = param_or(1, 1);
+        if (mode == 1) {
+          keyboard_flags_ = flags;
+        } else if (mode == 2) {
+          keyboard_flags_ |= flags;
+        } else if (mode == 3) {
+          keyboard_flags_ &= ~flags;
+        }
+        csi_private_ = false;
+        csi_secondary_ = false;
+        csi_pop_ = false;
+        csi_equals_ = false;
+        return;
+      }
+    }
+    if (is_secondary) {
+      csi_secondary_ = false;
+      csi_private_ = false;
+      csi_pop_ = false;
+      csi_equals_ = false;
+      return;
+    }
+
+    if (!is_private && final == 'c') {
+      send_bytes("\x1b[?1;2c", 7);
+      csi_secondary_ = false;
+      csi_pop_ = false;
+      csi_equals_ = false;
+      return;
+    }
+
+    if (is_private && (final == 'h' || final == 'l')) {
       const bool enable = final == 'h';
       for (int raw : csi_params_) {
         const int value = raw < 0 ? 0 : raw;
         if (value == 47 || value == 1047 || value == 1049) {
           set_alternate_screen(enable);
+        } else if (value == 1) {
+          application_cursor_keys_ = enable;
+        } else if (value == 6) {
+          origin_mode_ = enable;
         } else if (value == 2004) {
           bracketed_paste_mode_ = enable;
         } else if (value == 1000) {
@@ -1169,14 +1586,28 @@ private:
           mouse_sgr_mode_ = enable;
         } else if (value == 1015) {
           mouse_sgr_mode_ = enable;
+        } else if (value == 25) {
+          cursor_hidden_by_app_ = !enable;
+          cursor_visible_ = enable && focused_;
         }
       }
       csi_private_ = false;
+      csi_secondary_ = false;
+      csi_pop_ = false;
+      csi_equals_ = false;
       return;
     }
 
-    if (csi_private_) {
+    if (is_private) {
       csi_private_ = false;
+      csi_pop_ = false;
+      csi_equals_ = false;
+      return;
+    }
+    if (is_pop || is_equals) {
+      csi_pop_ = false;
+      csi_equals_ = false;
+      return;
     }
 
     switch (final) {
@@ -1194,8 +1625,17 @@ private:
         break;
       case 'H':
       case 'f':
-        cursor_y_ = std::clamp(param_or(0, 1) - 1, 0, static_cast<int>(rows_) - 1);
+        cursor_y_ = clamp_cursor_row(param_or(0, 1) - 1);
         cursor_x_ = std::clamp(param_or(1, 1) - 1, 0, static_cast<int>(cols_) - 1);
+        break;
+      case 'd':
+        cursor_y_ = clamp_cursor_row(param_or(0, 1) - 1);
+        break;
+      case 'a':
+        cursor_x_ = std::min(static_cast<int>(cols_) - 1, cursor_x_ + param_or(0, 1));
+        break;
+      case 'e':
+        cursor_y_ = clamp_cursor_row(cursor_y_ + param_or(0, 1));
         break;
       case 'J': {
         const int mode = param_or(0, 0);
@@ -1218,30 +1658,82 @@ private:
       case 'G':
         cursor_x_ = std::clamp(param_or(0, 1) - 1, 0, static_cast<int>(cols_) - 1);
         break;
+      case 'r': {
+        const int top = param_or(0, 1) - 1;
+        const int bottom = param_or(1, static_cast<int>(rows_)) - 1;
+        set_scroll_region(top, bottom);
+        break;
+      }
+      case 'L':
+        insert_lines(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'M':
+        delete_lines(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'P':
+        delete_chars(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case '@':
+        insert_chars(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'X':
+        erase_chars(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'S':
+        scroll_region_up(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'T':
+        scroll_region_down(static_cast<unsigned int>(std::max(1, param_or(0, 1))));
+        break;
+      case 'n': {
+        const int mode = param_or(0, 0);
+        if (mode == 5) {
+          send_bytes("\x1b[0n", 4);
+        } else if (mode == 6) {
+          std::ostringstream out;
+          out << "\x1b[" << (cursor_y_ + 1) << ';' << (cursor_x_ + 1) << 'R';
+          const std::string seq = out.str();
+          send_bytes(seq.data(), seq.size());
+        }
+        break;
+      }
       case 'm':
         apply_sgr();
         break;
       case 's':
-        save_cursor();
+        if (!is_private && !is_secondary && csi_params_.empty()) {
+          save_cursor();
+        }
         break;
       case 'u':
-        restore_cursor();
+        if (!is_private && !is_secondary && csi_params_.empty()) {
+          restore_cursor();
+        }
         break;
       default:
         break;
     }
+    csi_secondary_ = false;
   }
 
   void apply_sgr() {
-    if (csi_params_.empty() || (csi_params_.size() == 1 && csi_params_[0] < 0)) {
+    apply_sgr_params(csi_params_);
+  }
+
+  void apply_sgr_raw(const std::string& raw) {
+    apply_sgr_params(parse_sgr_params(raw));
+  }
+
+  void apply_sgr_params(const std::vector<int>& params) {
+    if (params.empty() || (params.size() == 1 && params[0] < 0)) {
       current_fg_pixel_ = foreground_pixel_;
       current_bg_pixel_ = background_pixel_;
       current_bold_ = false;
       current_inverse_ = false;
       return;
     }
-    for (std::size_t i = 0; i < csi_params_.size(); ++i) {
-      const int value = csi_params_[i] < 0 ? 0 : csi_params_[i];
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      const int value = params[i] < 0 ? 0 : params[i];
       if (value == 0) {
         current_fg_pixel_ = foreground_pixel_;
         current_bg_pixel_ = background_pixel_;
@@ -1251,6 +1743,10 @@ private:
         current_bold_ = true;
       } else if (value == 22) {
         current_bold_ = false;
+      } else if (value == 4) {
+        current_underline_ = true;
+      } else if (value == 24) {
+        current_underline_ = false;
       } else if (value == 7) {
         current_inverse_ = true;
       } else if (value == 27) {
@@ -1270,20 +1766,20 @@ private:
         current_bg_pixel_ = palette_[static_cast<std::size_t>(value - 100 + 8)];
       } else if (value == 38 || value == 48) {
         const bool is_fg = value == 38;
-        if (i + 1 < csi_params_.size()) {
-          const int mode = csi_params_[i + 1] < 0 ? 0 : csi_params_[i + 1];
-          if (mode == 5 && i + 2 < csi_params_.size()) {
-            const unsigned long pixel = color_table_[static_cast<std::size_t>(std::clamp(csi_params_[i + 2], 0, 255))];
+        if (i + 1 < params.size()) {
+          const int mode = params[i + 1] < 0 ? 0 : params[i + 1];
+          if (mode == 5 && i + 2 < params.size()) {
+            const unsigned long pixel = color_table_[static_cast<std::size_t>(std::clamp(params[i + 2], 0, 255))];
             if (is_fg) {
               current_fg_pixel_ = pixel;
             } else {
               current_bg_pixel_ = pixel;
             }
             i += 2;
-          } else if (mode == 2 && i + 4 < csi_params_.size()) {
-            const unsigned int r = static_cast<unsigned int>(std::clamp(csi_params_[i + 2], 0, 255));
-            const unsigned int g = static_cast<unsigned int>(std::clamp(csi_params_[i + 3], 0, 255));
-            const unsigned int b = static_cast<unsigned int>(std::clamp(csi_params_[i + 4], 0, 255));
+          } else if (mode == 2 && i + 4 < params.size()) {
+            const unsigned int r = static_cast<unsigned int>(std::clamp(params[i + 2], 0, 255));
+            const unsigned int g = static_cast<unsigned int>(std::clamp(params[i + 3], 0, 255));
+            const unsigned int b = static_cast<unsigned int>(std::clamp(params[i + 4], 0, 255));
             const unsigned long pixel = rgb_pixel(display_, screen_, r, g, b);
             if (is_fg) {
               current_fg_pixel_ = pixel;
@@ -1304,6 +1800,7 @@ private:
     saved_bg_pixel_ = current_bg_pixel_;
     saved_bold_ = current_bold_;
     saved_inverse_ = current_inverse_;
+    saved_underline_ = current_underline_;
     has_saved_ = true;
   }
 
@@ -1317,6 +1814,7 @@ private:
     current_bg_pixel_ = saved_bg_pixel_;
     current_bold_ = saved_bold_;
     current_inverse_ = saved_inverse_;
+    current_underline_ = saved_underline_;
   }
 
   void apply_osc() {
@@ -1329,9 +1827,108 @@ private:
       return;
     }
     const int command = std::atoi(osc_buffer_.substr(0, separator).c_str());
-    const std::string value = osc_buffer_.substr(separator + 1);
-    if (command == 0 || command == 2) {
-      XStoreName(display_, window_, value.c_str());
+    const std::string rest = osc_buffer_.substr(separator + 1);
+    if (command == 4) {
+      const auto second = rest.find(';');
+      if (second != std::string::npos) {
+        const std::string index_text = trim_osc_value(rest.substr(0, second));
+        const std::string value = trim_osc_value(rest.substr(second + 1));
+        const int index = std::atoi(index_text.c_str());
+        if (value == "?") {
+          if (index >= 0 && index < 16) {
+            const std::string reply = rgb_spec_reply(pixel_to_rgb(display_, screen_, palette_[index]), 4);
+            send_bytes(reply.data(), reply.size());
+          } else if (index >= 0 && index < 256) {
+            const std::string reply = rgb_spec_reply(pixel_to_rgb(display_, screen_, color_table_[index]), 4);
+            send_bytes(reply.data(), reply.size());
+          }
+        } else if (auto rgb = parse_rgb_spec(value)) {
+          const unsigned long pixel = rgb_pixel(display_, screen_, rgb->r, rgb->g, rgb->b);
+          if (index >= 0 && index < 16) {
+            palette_[index] = pixel;
+          }
+          if (index >= 0 && index < 256) {
+            color_table_[index] = pixel;
+          }
+        }
+      } else if (rest == "?" || rest.empty()) {
+        for (unsigned int i = 0; i < 16; ++i) {
+          const std::string reply = rgb_spec_reply(pixel_to_rgb(display_, screen_, palette_[i]), 4);
+          send_bytes(reply.data(), reply.size());
+        }
+      }
+    } else if (command == 104) {
+      if (rest.empty() || rest == "0") {
+        for (std::size_t i = 0; i < default_palette_.size(); ++i) {
+          palette_[i] = default_palette_[i];
+        }
+        for (std::size_t i = 0; i < default_color_table_.size(); ++i) {
+          color_table_[i] = default_color_table_[i];
+        }
+      } else {
+        std::stringstream stream(rest);
+        std::string item;
+        while (std::getline(stream, item, ';')) {
+          const int index = std::atoi(item.c_str());
+          if (index >= 0 && index < 16) {
+            palette_[index] = default_palette_[static_cast<std::size_t>(index)];
+          }
+          if (index >= 0 && index < 256) {
+            color_table_[index] = default_color_table_[static_cast<std::size_t>(index)];
+          }
+        }
+      }
+    } else if (command == 10 || command == 11 || command == 12) {
+      const std::string value = trim_osc_value(rest);
+      if (value == "?") {
+        const unsigned long pixel = command == 10 ? foreground_pixel_ : command == 11 ? background_pixel_ : cursor_pixel_;
+        const std::string reply = rgb_spec_reply(pixel_to_rgb(display_, screen_, pixel), command);
+        chiux::log::info("chiux-te-2 replied to OSC color query");
+        send_bytes(reply.data(), reply.size());
+      } else if (auto rgb = parse_rgb_spec(value)) {
+        const unsigned long pixel = rgb_pixel(display_, screen_, rgb->r, rgb->g, rgb->b);
+        if (command == 10) {
+          foreground_pixel_ = pixel;
+        } else if (command == 11) {
+          background_pixel_ = pixel;
+        } else {
+          cursor_pixel_ = pixel;
+        }
+        current_fg_pixel_ = foreground_pixel_;
+        current_bg_pixel_ = background_pixel_;
+      }
+    }
+    if (command == 0 || command == 1 || command == 2) {
+      const std::string value = trim_osc_value(rest);
+      if (command == 0 || command == 2) {
+        XStoreName(display_, window_, value.c_str());
+      }
+      if (command == 0 || command == 1) {
+        XSetIconName(display_, window_, value.c_str());
+      }
+    } else if (command == 8) {
+      const auto second = rest.find(';');
+      if (second != std::string::npos) {
+        const std::string uri = trim_osc_value(rest.substr(second + 1));
+        current_hyperlink_active_ = !uri.empty();
+        current_hyperlink_uri_ = uri;
+        if (uri.empty()) {
+          current_hyperlink_uri_.clear();
+        }
+      }
+    } else if (command == 52) {
+      const auto second = rest.find(';');
+      if (second != std::string::npos) {
+        const std::string encoded = trim_osc_value(rest.substr(second + 1));
+        const std::string decoded = base64_decode(encoded);
+        if (!decoded.empty()) {
+          clipboard_text_ = decoded;
+          clipboard_from_osc_ = true;
+          if (clipboard_atom_ != None) {
+            XSetSelectionOwner(display_, clipboard_atom_, window_, CurrentTime);
+          }
+        }
+      }
     }
     osc_buffer_.clear();
   }
@@ -1348,6 +1945,14 @@ private:
       alternate_screen_state_.current_bg_pixel = current_bg_pixel_;
       alternate_screen_state_.current_bold = current_bold_;
       alternate_screen_state_.current_inverse = current_inverse_;
+      alternate_screen_state_.current_underline = current_underline_;
+      alternate_screen_state_.current_hyperlink_active = current_hyperlink_active_;
+      alternate_screen_state_.current_hyperlink_uri = current_hyperlink_uri_;
+      alternate_screen_state_.keyboard_flags = keyboard_flags_;
+      alternate_screen_state_.keyboard_mode_stack = keyboard_mode_stack_;
+      alternate_screen_state_.scroll_region_top = scroll_region_top_;
+      alternate_screen_state_.scroll_region_bottom = scroll_region_bottom_;
+      alternate_screen_state_.origin_mode = origin_mode_;
       alternate_screen_state_.history_rows = history_rows_;
       alternate_screen_state_.scrollback_offset = scrollback_offset_;
       alternate_screen_state_.g0_special_graphics = g0_special_graphics_;
@@ -1361,6 +1966,7 @@ private:
       }
       cursor_x_ = 0;
       cursor_y_ = 0;
+      reset_scroll_region();
     } else if (alternate_screen_state_.active) {
       cells_ = alternate_screen_state_.cells;
       cursor_x_ = alternate_screen_state_.cursor_x;
@@ -1369,12 +1975,21 @@ private:
       current_bg_pixel_ = alternate_screen_state_.current_bg_pixel;
       current_bold_ = alternate_screen_state_.current_bold;
       current_inverse_ = alternate_screen_state_.current_inverse;
+      current_underline_ = alternate_screen_state_.current_underline;
+      current_hyperlink_active_ = alternate_screen_state_.current_hyperlink_active;
+      current_hyperlink_uri_ = alternate_screen_state_.current_hyperlink_uri;
+      keyboard_flags_ = alternate_screen_state_.keyboard_flags;
+      keyboard_mode_stack_ = alternate_screen_state_.keyboard_mode_stack;
+      scroll_region_top_ = alternate_screen_state_.scroll_region_top;
+      scroll_region_bottom_ = alternate_screen_state_.scroll_region_bottom;
+      origin_mode_ = alternate_screen_state_.origin_mode;
       history_rows_ = alternate_screen_state_.history_rows;
       scrollback_offset_ = alternate_screen_state_.scrollback_offset;
       g0_special_graphics_ = alternate_screen_state_.g0_special_graphics;
       g1_special_graphics_ = alternate_screen_state_.g1_special_graphics;
       use_g1_charset_ = alternate_screen_state_.use_g1_charset;
       alternate_screen_state_.active = false;
+      reset_scroll_region();
     }
     alternate_screen_active_ = enable;
     redraw();
@@ -1449,6 +2064,7 @@ private:
       cell.bg = current_bg_pixel_;
       cell.bold = current_bold_;
       cell.inverse = current_inverse_;
+      cell.underlined = current_underline_ || current_hyperlink_active_;
       cell.continuation = false;
       if (width > 1) {
         const std::size_t next_index = index + 1;
@@ -1458,6 +2074,7 @@ private:
           cells_[next_index].bg = current_bg_pixel_;
           cells_[next_index].bold = current_bold_;
           cells_[next_index].inverse = current_inverse_;
+          cells_[next_index].underlined = current_underline_ || current_hyperlink_active_;
           cells_[next_index].continuation = true;
         }
       }
@@ -1505,18 +2122,20 @@ private:
   }
 
   void line_feed() {
-    ++cursor_y_;
-    if (cursor_y_ >= static_cast<int>(rows_)) {
-      scroll_up();
-      cursor_y_ = static_cast<int>(rows_) - 1;
+    if (cursor_y_ < scroll_region_bottom_) {
+      ++cursor_y_;
+    } else {
+      scroll_region_up(1);
+      cursor_y_ = scroll_region_bottom_;
     }
   }
 
   void reverse_index() {
-    if (cursor_y_ == 0) {
-      scroll_down();
-    } else {
+    if (cursor_y_ > scroll_region_top_) {
       --cursor_y_;
+    } else {
+      scroll_region_down(1);
+      cursor_y_ = scroll_region_top_;
     }
   }
 
@@ -1579,8 +2198,180 @@ private:
 
   void clear_from_cursor() {
     clear_line_from_cursor();
-    for (unsigned int row = static_cast<unsigned int>(std::max(0, cursor_y_ + 1)); row < rows_; ++row) {
+    for (unsigned int row = static_cast<unsigned int>(std::max(0, cursor_y_ + 1)); row <= static_cast<unsigned int>(scroll_region_bottom_); ++row) {
       clear_row(row);
+    }
+  }
+
+  void reset_scroll_region() {
+    scroll_region_top_ = 0;
+    scroll_region_bottom_ = static_cast<int>(rows_ ? rows_ - 1 : 0);
+    origin_mode_ = false;
+  }
+
+  int clamp_cursor_row(int row) const {
+    if (origin_mode_) {
+      const int top = scroll_region_top_;
+      const int bottom = scroll_region_bottom_;
+      return std::clamp(top + row, top, bottom);
+    }
+    return std::clamp(row, 0, static_cast<int>(rows_) - 1);
+  }
+
+  void set_scroll_region(int top, int bottom) {
+    if (rows_ == 0) {
+      return;
+    }
+    const int max_row = static_cast<int>(rows_) - 1;
+    if (top < 0) {
+      top = 0;
+    }
+    if (bottom < 0 || bottom > max_row) {
+      bottom = max_row;
+    }
+    if (top >= bottom) {
+      reset_scroll_region();
+      return;
+    }
+    scroll_region_top_ = top;
+    scroll_region_bottom_ = bottom;
+    if (cursor_y_ < scroll_region_top_ || cursor_y_ > scroll_region_bottom_) {
+      cursor_y_ = scroll_region_top_;
+    }
+    cursor_x_ = std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1);
+  }
+
+  void scroll_region_up(unsigned int lines) {
+    if (rows_ == 0 || cols_ == 0 || lines == 0) {
+      return;
+    }
+    const unsigned int top = static_cast<unsigned int>(std::clamp(scroll_region_top_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int bottom = static_cast<unsigned int>(std::clamp(scroll_region_bottom_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int region_height = bottom >= top ? bottom - top + 1u : 0u;
+    if (region_height == 0) {
+      return;
+    }
+    const unsigned int amount = std::min(lines, region_height);
+    if (top == 0 && bottom + 1u == rows_) {
+      history_rows_.push_back(snapshot_row(0));
+      if (history_rows_.size() > history_limit_) {
+        history_rows_.pop_front();
+      }
+      if (scrollback_offset_ > 0) {
+        ++scrollback_offset_;
+      }
+    }
+    for (unsigned int line = 0; line < amount; ++line) {
+      for (unsigned int row = top; row < bottom; ++row) {
+        for (unsigned int col = 0; col < cols_; ++col) {
+          cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row + 1) * cols_ + col];
+        }
+      }
+      clear_row(bottom);
+    }
+  }
+
+  void scroll_region_down(unsigned int lines) {
+    if (rows_ == 0 || cols_ == 0 || lines == 0) {
+      return;
+    }
+    const unsigned int top = static_cast<unsigned int>(std::clamp(scroll_region_top_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int bottom = static_cast<unsigned int>(std::clamp(scroll_region_bottom_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int region_height = bottom >= top ? bottom - top + 1u : 0u;
+    if (region_height == 0) {
+      return;
+    }
+    const unsigned int amount = std::min(lines, region_height);
+    for (unsigned int line = 0; line < amount; ++line) {
+      for (unsigned int row = bottom; row > top; --row) {
+        for (unsigned int col = 0; col < cols_; ++col) {
+          cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row - 1) * cols_ + col];
+        }
+      }
+      clear_row(top);
+    }
+  }
+
+  void insert_lines(unsigned int lines) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < scroll_region_top_ || cursor_y_ > scroll_region_bottom_) {
+      return;
+    }
+    const unsigned int top = static_cast<unsigned int>(cursor_y_);
+    const unsigned int bottom = static_cast<unsigned int>(std::clamp(scroll_region_bottom_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int amount = std::min(lines, bottom - top + 1u);
+    for (unsigned int line = 0; line < amount; ++line) {
+      for (unsigned int row = bottom; row > top; --row) {
+        for (unsigned int col = 0; col < cols_; ++col) {
+          cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row - 1) * cols_ + col];
+        }
+      }
+      clear_row(top);
+    }
+  }
+
+  void delete_lines(unsigned int lines) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < scroll_region_top_ || cursor_y_ > scroll_region_bottom_) {
+      return;
+    }
+    const unsigned int top = static_cast<unsigned int>(cursor_y_);
+    const unsigned int bottom = static_cast<unsigned int>(std::clamp(scroll_region_bottom_, 0, static_cast<int>(rows_) - 1));
+    const unsigned int amount = std::min(lines, bottom - top + 1u);
+    for (unsigned int line = 0; line < amount; ++line) {
+      for (unsigned int row = top; row < bottom; ++row) {
+        for (unsigned int col = 0; col < cols_; ++col) {
+          cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row + 1) * cols_ + col];
+        }
+      }
+      clear_row(bottom);
+    }
+  }
+
+  void insert_chars(unsigned int chars) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < 0 || cursor_y_ >= static_cast<int>(rows_)) {
+      return;
+    }
+    const unsigned int row = static_cast<unsigned int>(cursor_y_);
+    const unsigned int start = static_cast<unsigned int>(std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1));
+    const unsigned int amount = std::min(chars, cols_ - start);
+    if (amount == 0) {
+      return;
+    }
+    for (int col = static_cast<int>(cols_) - 1; col >= static_cast<int>(start + amount); --col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + static_cast<std::size_t>(col)] =
+          cells_[static_cast<std::size_t>(row) * cols_ + static_cast<std::size_t>(col - static_cast<int>(amount))];
+    }
+    for (unsigned int col = 0; col < amount; ++col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + start + col] = Cell{};
+    }
+  }
+
+  void delete_chars(unsigned int chars) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < 0 || cursor_y_ >= static_cast<int>(rows_)) {
+      return;
+    }
+    const unsigned int row = static_cast<unsigned int>(cursor_y_);
+    const unsigned int start = static_cast<unsigned int>(std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1));
+    const unsigned int amount = std::min(chars, cols_ - start);
+    if (amount == 0) {
+      return;
+    }
+    for (unsigned int col = start; col + amount < cols_; ++col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + col] = cells_[static_cast<std::size_t>(row) * cols_ + col + amount];
+    }
+    for (unsigned int col = cols_ - amount; col < cols_; ++col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + col] = Cell{};
+    }
+  }
+
+  void erase_chars(unsigned int chars) {
+    if (rows_ == 0 || cols_ == 0 || cursor_y_ < 0 || cursor_y_ >= static_cast<int>(rows_)) {
+      return;
+    }
+    const unsigned int row = static_cast<unsigned int>(cursor_y_);
+    const unsigned int start = static_cast<unsigned int>(std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1));
+    const unsigned int amount = std::min(chars, cols_ - start);
+    for (unsigned int col = 0; col < amount; ++col) {
+      cells_[static_cast<std::size_t>(row) * cols_ + start + col] = Cell{};
     }
   }
 
@@ -1701,8 +2492,9 @@ private:
     selecting_ = false;
     selection_text_.clear();
     XSetSelectionOwner(display_, XA_PRIMARY, None, CurrentTime);
-    if (clipboard_atom_ != None) {
+    if (clipboard_atom_ != None && !clipboard_from_osc_) {
       XSetSelectionOwner(display_, clipboard_atom_, None, CurrentTime);
+      clipboard_text_.clear();
     }
   }
 
@@ -1720,6 +2512,8 @@ private:
     selection_.active = true;
     selection_text_ = selection_text_for_range(selection_);
     if (!selection_text_.empty()) {
+      clipboard_text_ = selection_text_;
+      clipboard_from_osc_ = false;
       XSetSelectionOwner(display_, XA_PRIMARY, window_, CurrentTime);
       if (clipboard_atom_ != None) {
         XSetSelectionOwner(display_, clipboard_atom_, window_, CurrentTime);
@@ -1751,7 +2545,29 @@ private:
       }
       return;
     }
-    XConvertSelection(display_, XA_PRIMARY, utf8_string_atom_, paste_property_, window_, CurrentTime);
+    if (XGetSelectionOwner(display_, XA_PRIMARY) != None) {
+      XConvertSelection(display_, XA_PRIMARY, utf8_string_atom_, paste_property_, window_, CurrentTime);
+      return;
+    }
+    request_clipboard_paste();
+  }
+
+  void request_clipboard_paste() {
+    if (clipboard_atom_ == None) {
+      request_primary_paste();
+      return;
+    }
+    if (XGetSelectionOwner(display_, clipboard_atom_) == window_ && !clipboard_text_.empty()) {
+      if (bracketed_paste_mode_) {
+        send_bytes("\x1b[200~", 6);
+      }
+      send_bytes(clipboard_text_.data(), clipboard_text_.size());
+      if (bracketed_paste_mode_) {
+        send_bytes("\x1b[201~", 6);
+      }
+      return;
+    }
+    XConvertSelection(display_, clipboard_atom_, utf8_string_atom_, paste_property_, window_, CurrentTime);
   }
 
   struct LineEditor {
@@ -1978,7 +2794,21 @@ private:
     redraw();
   }
 
-  void send_mouse_report(int button, int x, int y, bool release, bool motion) {
+  unsigned int mouse_modifier_bits(unsigned int state) const {
+    unsigned int bits = 0;
+    if ((state & ShiftMask) != 0) {
+      bits |= 4u;
+    }
+    if ((state & Mod1Mask) != 0) {
+      bits |= 8u;
+    }
+    if ((state & ControlMask) != 0) {
+      bits |= 16u;
+    }
+    return bits;
+  }
+
+  void send_mouse_report(int button, int x, int y, bool release, bool motion, unsigned int state = 0) {
     if (!mouse_reporting_) {
       return;
     }
@@ -1991,10 +2821,20 @@ private:
     if (release) {
       code = 3;
     }
+    code += static_cast<int>(mouse_modifier_bits(state));
     std::ostringstream out;
     out << "\x1b[<" << code << ';' << cell_x << ';' << cell_y << (release ? 'm' : 'M');
     const std::string seq = out.str();
     send_bytes(seq.data(), seq.size());
+  }
+
+  void send_mouse_release_if_needed(const XButtonEvent& event, int content_y) {
+    if (!mouse_reporting_) {
+      return;
+    }
+    if (event.button == Button1 || event.button == Button2 || event.button == Button3) {
+      send_mouse_report(event.button == Button1 ? 0 : event.button == Button2 ? 1 : 2, event.x, content_y, true, false, event.state);
+    }
   }
 
   void redraw() {
@@ -2018,6 +2858,37 @@ private:
     XSetForeground(display_, gc_, bezel_shadow_pixel_);
     XDrawLine(display_, backing_, gc_, 1, static_cast<int>(height_) - 2, static_cast<int>(width_) - 2, static_cast<int>(height_) - 2);
     XDrawLine(display_, backing_, gc_, static_cast<int>(width_) - 2, 1, static_cast<int>(width_) - 2, static_cast<int>(height_) - 2);
+
+    struct TextTone {
+      unsigned long fg = 0;
+      unsigned long shadow = 0;
+      unsigned long outline = 0;
+      bool use_shadow = false;
+      bool use_outline = false;
+    };
+    const auto adaptive_tone = [&](unsigned long bg_pixel, unsigned long fg_pixel) {
+      const unsigned int bg = cached_color(bg_pixel).luma;
+      const unsigned int fg = cached_color(fg_pixel).luma;
+      const unsigned int darker = std::min(bg, fg);
+      const unsigned int lighter = std::max(bg, fg);
+      const unsigned int contrast = ((lighter + 16u) * 1000u) / (darker + 16u);
+      if (contrast >= 5200u) {
+        return TextTone{fg_pixel, 0, false};
+      }
+      const bool light_bg = bg >= 128u;
+      const Rgb fg_rgb = cached_color(fg_pixel).rgb;
+      const Rgb rescue_rgb = light_bg ? Rgb{14, 14, 14} : Rgb{244, 244, 244};
+      const unsigned int boost = contrast < 1400u ? 94u : contrast < 2200u ? 82u : contrast < 3200u ? 66u : 40u;
+      const Rgb boosted_rgb = shift_contrast_rgb(fg_rgb, light_bg, boost);
+      const bool use_outline = contrast < 2600u;
+      return TextTone{
+          rgb_pixel(display_, screen_, boosted_rgb.r, boosted_rgb.g, boosted_rgb.b),
+          rgb_pixel(display_, screen_, rescue_rgb.r, rescue_rgb.g, rescue_rgb.b),
+          rgb_pixel(display_, screen_, rescue_rgb.r, rescue_rgb.g, rescue_rgb.b),
+          true,
+          use_outline,
+      };
+    };
 
     XSetForeground(display_, gc_, chrome_text_pixel_);
     draw_text(8, static_cast<int>(chrome_height_ > 4 ? chrome_height_ - 7 : chrome_height_ - 2), "Feel", chrome_text_pixel_);
@@ -2094,7 +2965,8 @@ private:
         }
         const bool selected = selection_.active && cell_selected(row, col);
         const bool inverse = selected || cell.inverse;
-        const unsigned long fg_pixel = inverse ? cell.bg : cell.fg;
+        const TextTone tone = adaptive_tone(inverse ? cell.fg : cell.bg, inverse ? cell.bg : cell.fg);
+        const unsigned long fg_pixel = tone.fg;
         const unsigned long bg_pixel = cell.text.empty()
             ? background_pixel_
             : (inverse ? cell.fg : cell.bg);
@@ -2102,14 +2974,43 @@ private:
         XSetForeground(display_, gc_, bg_pixel);
         XFillRectangle(display_, backing_, gc_, x, content_y_offset + static_cast<int>(row * cell_h_), cell_w_, cell_h_);
         if (!cell.continuation && !cell.text.empty()) {
-          draw_text(x, baseline, cell.text, fg_pixel);
+          auto paint_text_crisp = [&](int px, int py, unsigned long pixel) {
+            XSetForeground(display_, gc_, pixel);
+            if (fontset_) {
+              XmbDrawString(display_, backing_, fontset_, gc_, px, py, cell.text.c_str(), static_cast<int>(cell.text.size()));
+            } else if (font_) {
+              XDrawString(display_, backing_, gc_, px, py, cell.text.c_str(), static_cast<int>(cell.text.size()));
+            } else {
+              draw_text(px, py, cell.text, pixel);
+            }
+          };
+          if (tone.use_outline) {
+            paint_text_crisp(x - 1, baseline, tone.outline);
+            paint_text_crisp(x + 1, baseline, tone.outline);
+            paint_text_crisp(x, baseline - 1, tone.outline);
+            paint_text_crisp(x, baseline + 1, tone.outline);
+            paint_text_crisp(x - 1, baseline - 1, tone.outline);
+            paint_text_crisp(x + 1, baseline - 1, tone.outline);
+            paint_text_crisp(x - 1, baseline + 1, tone.outline);
+            paint_text_crisp(x + 1, baseline + 1, tone.outline);
+          }
+          if (tone.use_shadow) {
+            paint_text_crisp(x + 1, baseline + 1, tone.shadow);
+          }
+          paint_text_crisp(x, baseline, fg_pixel);
+          if (cell.underlined) {
+            XSetForeground(display_, gc_, fg_pixel);
+            const int underline_y = baseline + 1;
+            const int underline_width = std::max(1, text_width(cell.text));
+            XDrawLine(display_, backing_, gc_, x, underline_y, x + underline_width - 1, underline_y);
+          }
         }
       }
     }
 
     const int cursor_x_px = cursor_x_ * static_cast<int>(cell_w_);
     const int cursor_y_px = content_y_offset + cursor_y_ * static_cast<int>(cell_h_);
-    if (scrollback_offset_ == 0 && cursor_visible_ && focused_ && cursor_x_ >= 0 && cursor_y_ >= 0) {
+    if (scrollback_offset_ == 0 && cursor_visible_ && focused_ && !cursor_hidden_by_app_ && cursor_x_ >= 0 && cursor_y_ >= 0) {
       const Cell& cell = cells_[static_cast<std::size_t>(std::clamp(cursor_y_, 0, static_cast<int>(rows_) - 1)) * cols_
                                      + static_cast<std::size_t>(std::clamp(cursor_x_, 0, static_cast<int>(cols_) - 1))];
       XSetForeground(display_, gc_, cursor_pixel_);
@@ -2117,7 +3018,9 @@ private:
       XSetForeground(display_, gc_, background_pixel_);
       XDrawRectangle(display_, backing_, gc_, cursor_x_px, cursor_y_px, cell_w_ - 1, cell_h_ - 1);
       if (!cell.continuation && !cell.text.empty()) {
-        draw_text(cursor_x_px, cursor_y_px + static_cast<int>(ascent_), cell.text, cell.bg);
+        if (!draw_fallback_glyph(cursor_x_px, cursor_y_px + static_cast<int>(ascent_), cell.text, cell.bg)) {
+          draw_text(cursor_x_px, cursor_y_px + static_cast<int>(ascent_), cell.text, cell.bg);
+        }
       }
     }
 
@@ -2131,7 +3034,7 @@ private:
       try {
         config_.save(config_path_);
       } catch (const std::exception& ex) {
-        chiux::log::warn(std::string("chiux-te failed to save feel: ") + ex.what());
+        chiux::log::warn(std::string("chiux-te-2 failed to save feel: ") + ex.what());
       }
     }
   }
@@ -2213,7 +3116,7 @@ private:
 
   void handle_focus_in() {
     focused_ = true;
-    cursor_visible_ = true;
+    cursor_visible_ = !cursor_hidden_by_app_;
     next_cursor_toggle_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(525);
     redraw();
   }
@@ -2241,7 +3144,7 @@ private:
 
     if (event.button == Button4) {
       if (mouse_reporting_) {
-        send_mouse_report(64, event.x, content_y, false, false);
+        send_mouse_report(64, event.x, content_y, false, false, event.state);
         return;
       }
       scroll_scrollback(3);
@@ -2249,14 +3152,14 @@ private:
     }
     if (event.button == Button5) {
       if (mouse_reporting_) {
-        send_mouse_report(65, event.x, content_y, false, false);
+        send_mouse_report(65, event.x, content_y, false, false, event.state);
         return;
       }
       scroll_scrollback(-3);
       return;
     }
     if (mouse_reporting_ && (event.state & ShiftMask) == 0 && (event.button == Button1 || event.button == Button2 || event.button == Button3)) {
-      send_mouse_report(event.button == Button1 ? 0 : event.button == Button2 ? 1 : 2, event.x, content_y, false, false);
+      send_mouse_report(event.button == Button1 ? 0 : event.button == Button2 ? 1 : 2, event.x, content_y, false, false, event.state);
       return;
     }
     if (event.button == Button2) {
@@ -2289,7 +3192,7 @@ private:
   void handle_button_release(const XButtonEvent& event) {
     const int content_y = std::max(0, event.y - static_cast<int>(chrome_height_));
     if (mouse_reporting_ && (event.state & ShiftMask) == 0 && (event.button == Button1 || event.button == Button2 || event.button == Button3)) {
-      send_mouse_report(event.button == Button1 ? 0 : event.button == Button2 ? 1 : 2, event.x, content_y, true, false);
+      send_mouse_release_if_needed(event, content_y);
       return;
     }
     if (event.button == Button1 && selecting_) {
@@ -2316,7 +3219,7 @@ private:
       } else {
         button = 3;
       }
-      send_mouse_report(button, event.x, content_y, false, true);
+      send_mouse_report(button, event.x, content_y, false, true, event.state);
       return;
     }
     if (selecting_) {
@@ -2334,7 +3237,20 @@ private:
     response.property = None;
     response.time = event.time;
 
-    const bool have_text = !selection_text_.empty();
+    const std::string* response_text = nullptr;
+    if (event.selection == clipboard_atom_) {
+      if (!clipboard_text_.empty()) {
+        response_text = &clipboard_text_;
+      }
+    } else if (event.selection == XA_PRIMARY) {
+      if (!selection_text_.empty()) {
+        response_text = &selection_text_;
+      }
+    } else if (!selection_text_.empty()) {
+      response_text = &selection_text_;
+    } else if (!clipboard_text_.empty()) {
+      response_text = &clipboard_text_;
+    }
     const auto send_property = [&](Atom target, Atom property, const unsigned char* data, int format, std::size_t length) {
       XChangeProperty(display_, event.requestor, property, target, format, PropModeReplace, data, static_cast<int>(length));
       response.property = property;
@@ -2344,9 +3260,9 @@ private:
       Atom targets[] = {targets_atom_, utf8_string_atom_, text_atom_, XA_STRING};
       send_property(event.target, event.property == None ? event.target : event.property,
                     reinterpret_cast<const unsigned char*>(targets), 32, std::size_t{4});
-    } else if ((event.target == utf8_string_atom_ || event.target == text_atom_ || event.target == XA_STRING) && have_text) {
+    } else if ((event.target == utf8_string_atom_ || event.target == text_atom_ || event.target == XA_STRING) && response_text) {
       send_property(event.target, event.property == None ? event.target : event.property,
-                    reinterpret_cast<const unsigned char*>(selection_text_.data()), 8, selection_text_.size());
+                    reinterpret_cast<const unsigned char*>(response_text->data()), 8, response_text->size());
     }
 
     XEvent reply{};
@@ -2358,6 +3274,9 @@ private:
     selection_.active = false;
     selection_text_.clear();
     selecting_ = false;
+    if (!clipboard_from_osc_) {
+      clipboard_text_.clear();
+    }
     redraw();
   }
 
@@ -2382,6 +3301,9 @@ private:
 
   void tick_cursor_blink() {
     if (!focused_) {
+      return;
+    }
+    if (cursor_hidden_by_app_) {
       return;
     }
     if (scrollback_offset_ != 0) {
@@ -2444,7 +3366,7 @@ private:
         }
       }
       if (sym == XK_V || sym == XK_v) {
-        request_primary_paste();
+        request_clipboard_paste();
         return;
       }
     }
@@ -2504,6 +3426,11 @@ private:
       send_bytes(&ch, 1);
     };
 
+    auto send_cursor_sequence = [&](const char* normal, const char* application) {
+      const char* seq = application_cursor_keys_ ? application : normal;
+      send_bytes(seq, std::strlen(seq));
+    };
+
     if ((event.state & Mod1Mask) != 0 && length > 0) {
       send_char('\x1b');
       send_bytes(buffer, static_cast<std::size_t>(length));
@@ -2528,7 +3455,11 @@ private:
       case XK_Return:
       case XK_KP_Enter:
         commit_current_line_history();
-        send_char('\r');
+        if (application_keypad_mode_ && sym == XK_KP_Enter) {
+          send_bytes("\x1bOM", 3);
+        } else {
+          send_char('\r');
+        }
         editor_.text.clear();
         editor_.cursor = 0;
         clear_completion_state();
@@ -2556,35 +3487,76 @@ private:
         break;
       case XK_Left:
         move_cursor_left();
+        send_cursor_sequence("\x1b[D", "\x1bOD");
+        break;
+      case XK_KP_Left:
+        move_cursor_left();
+        send_cursor_sequence("\x1b[D", "\x1bOD");
         break;
       case XK_Right:
         move_cursor_right();
+        send_cursor_sequence("\x1b[C", "\x1bOC");
+        break;
+      case XK_KP_Right:
+        move_cursor_right();
+        send_cursor_sequence("\x1b[C", "\x1bOC");
         break;
       case XK_Up:
         clear_completion_state();
         editor_.text.clear();
         editor_.cursor = 0;
-        send_bytes("\x1b[A", 3);
+        send_cursor_sequence("\x1b[A", "\x1bOA");
+        break;
+      case XK_KP_Up:
+        clear_completion_state();
+        editor_.text.clear();
+        editor_.cursor = 0;
+        send_cursor_sequence("\x1b[A", "\x1bOA");
         break;
       case XK_Down:
         clear_completion_state();
         editor_.text.clear();
         editor_.cursor = 0;
-        send_bytes("\x1b[B", 3);
+        send_cursor_sequence("\x1b[B", "\x1bOB");
+        break;
+      case XK_KP_Down:
+        clear_completion_state();
+        editor_.text.clear();
+        editor_.cursor = 0;
+        send_cursor_sequence("\x1b[B", "\x1bOB");
         break;
       case XK_Home:
         move_cursor_home();
+        send_cursor_sequence("\x1b[H", "\x1bOH");
+        break;
+      case XK_KP_Home:
+        move_cursor_home();
+        send_cursor_sequence("\x1b[H", "\x1bOH");
         break;
       case XK_End:
         move_cursor_end();
+        send_cursor_sequence("\x1b[F", "\x1bOF");
+        break;
+      case XK_KP_End:
+        move_cursor_end();
+        send_cursor_sequence("\x1b[F", "\x1bOF");
         break;
       case XK_Delete:
+        erase_next_character();
+        break;
+      case XK_KP_Delete:
         erase_next_character();
         break;
       case XK_Page_Up:
         send_bytes("\x1b[5~", 4);
         break;
+      case XK_KP_Page_Up:
+        send_bytes("\x1b[5~", 4);
+        break;
       case XK_Page_Down:
+        send_bytes("\x1b[6~", 4);
+        break;
+      case XK_KP_Page_Down:
         send_bytes("\x1b[6~", 4);
         break;
       default:
@@ -2603,13 +3575,33 @@ private:
     current_bg_pixel_ = background_pixel_;
     current_bold_ = false;
     current_inverse_ = false;
+    current_underline_ = false;
+    current_hyperlink_active_ = false;
+    current_hyperlink_uri_.clear();
     g0_special_graphics_ = false;
     g1_special_graphics_ = false;
     use_g1_charset_ = false;
     state_ = ParseState::Ground;
     csi_params_.clear();
+    csi_raw_.clear();
     csi_current_ = 0;
     csi_have_value_ = false;
+    csi_private_ = false;
+    csi_secondary_ = false;
+    csi_pop_ = false;
+    csi_equals_ = false;
+    bracketed_paste_mode_ = false;
+    mouse_reporting_ = false;
+    mouse_motion_reporting_ = false;
+    mouse_sgr_mode_ = false;
+    application_cursor_keys_ = false;
+    application_keypad_mode_ = false;
+    cursor_hidden_by_app_ = false;
+    origin_mode_ = false;
+    keyboard_flags_ = 0;
+    keyboard_mode_stack_.clear();
+    reset_scroll_region();
+    cursor_visible_ = true;
     utf8_pending_.clear();
     utf8_expected_ = 0;
     osc_buffer_.clear();
@@ -2645,8 +3637,63 @@ private:
   }
 
   int text_width(const std::string& text) const {
-    return font_ ? XTextWidth(font_, text.c_str(), static_cast<int>(text.size()))
-                 : static_cast<int>(text.size()) * 6;
+    if (xft_font_) {
+      XGlyphInfo extents{};
+      XftTextExtentsUtf8(display_, xft_font_, reinterpret_cast<const FcChar8*>(text.c_str()), static_cast<int>(text.size()), &extents);
+      return static_cast<int>(extents.xOff);
+    }
+    if (fontset_) {
+      return XmbTextEscapement(fontset_, text.c_str(), static_cast<int>(text.size()));
+    }
+    if (font_) {
+      return XTextWidth(font_, text.c_str(), static_cast<int>(text.size()));
+    }
+    return static_cast<int>(text.size()) * 6;
+  }
+
+  const CachedColor& cached_color(unsigned long pixel) const {
+    auto it = color_cache_.find(pixel);
+    if (it != color_cache_.end()) {
+      return it->second;
+    }
+    XColor color{};
+    color.pixel = pixel;
+    XQueryColor(display_, DefaultColormap(display_, screen_), &color);
+    CachedColor cached{};
+    cached.rgb = {
+        static_cast<unsigned int>(color.red / 257u),
+        static_cast<unsigned int>(color.green / 257u),
+        static_cast<unsigned int>(color.blue / 257u),
+    };
+    cached.luma = static_cast<unsigned int>((color.red * 299u + color.green * 587u + color.blue * 114u) / 1000u);
+    cached.ready = true;
+    auto [inserted, _] = color_cache_.emplace(pixel, cached);
+    return inserted->second;
+  }
+
+  const XftColor& xft_color_for(unsigned long pixel) const {
+    auto it = xft_color_cache_.find(pixel);
+    if (it != xft_color_cache_.end()) {
+      return it->second;
+    }
+    const CachedColor& cached = cached_color(pixel);
+    XRenderColor render_color{};
+    render_color.red = static_cast<unsigned short>(cached.rgb.r * 257u);
+    render_color.green = static_cast<unsigned short>(cached.rgb.g * 257u);
+    render_color.blue = static_cast<unsigned short>(cached.rgb.b * 257u);
+    render_color.alpha = 0xFFFF;
+    XftColor color{};
+    if (XftColorAllocValue(display_, DefaultVisual(display_, screen_), DefaultColormap(display_, screen_), &render_color, &color) == 0) {
+      static XftColor fallback{};
+      fallback.pixel = pixel;
+      fallback.color.red = render_color.red;
+      fallback.color.green = render_color.green;
+      fallback.color.blue = render_color.blue;
+      fallback.color.alpha = render_color.alpha;
+      return fallback;
+    }
+    auto [inserted, _] = xft_color_cache_.emplace(pixel, color);
+    return inserted->second;
   }
 
   void draw_text(int x, int y, const std::string& text, unsigned long pixel) {
@@ -2654,11 +3701,182 @@ private:
       return;
     }
     XSetForeground(display_, gc_, pixel);
-    if (font_) {
-      XDrawString(display_, backing_, gc_, x, y, text.c_str(), static_cast<int>(text.size()));
+    if (xft_draw_ && xft_font_) {
+      const XftColor& color = xft_color_for(pixel);
+      XftDrawStringUtf8(xft_draw_, &color, xft_font_, x, y, reinterpret_cast<const FcChar8*>(text.c_str()), static_cast<int>(text.size()));
+    } else if (fontset_) {
+      XmbDrawString(display_, backing_, fontset_, gc_, x, y, text.c_str(), static_cast<int>(text.size()));
     } else {
       XDrawString(display_, backing_, gc_, x, y, text.c_str(), static_cast<int>(text.size()));
     }
+  }
+
+  bool draw_fallback_glyph(int x, int baseline, const std::string& text, unsigned long pixel) {
+    const auto codepoint = utf8_single_codepoint(text);
+    if (!codepoint) {
+      return false;
+    }
+    const int top = baseline - static_cast<int>(ascent_);
+    const int left = x;
+    const int right = x + static_cast<int>(cell_w_) - 1;
+    const int mid_x = x + static_cast<int>(cell_w_ / 2);
+    const int mid_y = top + static_cast<int>(cell_h_ / 2);
+    const int inner_left = x + 1;
+    const int inner_right = std::max(inner_left, right - 1);
+    const int inner_top = top + 1;
+    const int inner_bottom = std::max(inner_top, top + static_cast<int>(cell_h_) - 2);
+
+    auto draw_horizontal = [&](int y) {
+      XSetForeground(display_, gc_, pixel);
+      XDrawLine(display_, backing_, gc_, inner_left, y, inner_right, y);
+    };
+    auto draw_vertical = [&](int xx) {
+      XSetForeground(display_, gc_, pixel);
+      XDrawLine(display_, backing_, gc_, xx, inner_top, xx, inner_bottom);
+    };
+    auto draw_box = [&]() {
+      XSetForeground(display_, gc_, pixel);
+      const unsigned int fill_w = static_cast<unsigned int>(std::max(1, static_cast<int>(cell_w_) - 2));
+      const unsigned int fill_h = static_cast<unsigned int>(std::max(1, static_cast<int>(cell_h_) - 2));
+      XFillRectangle(display_, backing_, gc_, inner_left, inner_top, fill_w, fill_h);
+    };
+    auto draw_half = [&](bool upper, bool left_half) {
+      XSetForeground(display_, gc_, pixel);
+      const int fill_w = std::max(1, static_cast<int>(cell_w_ / 2));
+      const int fill_h = std::max(1, static_cast<int>(cell_h_ / 2));
+      const int fill_x = left_half ? left : mid_x;
+      const int fill_y = upper ? top : mid_y;
+      XFillRectangle(display_, backing_, gc_, fill_x, fill_y, static_cast<unsigned int>(fill_w), static_cast<unsigned int>(fill_h));
+    };
+    const char32_t cp = *codepoint;
+    if (cp >= 0x2800u && cp <= 0x28FFu) {
+      const unsigned int dots = static_cast<unsigned int>(cp - 0x2800u);
+        const int x1 = inner_left + 1;
+        const int x2 = std::max(x1, mid_x + 1);
+        const int y1 = inner_top + 1;
+        const int y2 = inner_top + std::max(1, static_cast<int>(cell_h_ / 4));
+        const int y3 = inner_top + std::max(2, static_cast<int>(cell_h_ / 2));
+        const int y4 = inner_top + std::max(3, static_cast<int>(cell_h_) - 3);
+        auto dot = [&](int xx, int yy) {
+          XSetForeground(display_, gc_, pixel);
+          XFillArc(display_, backing_, gc_, xx - 1, yy - 1, 3, 3, 0, 360 * 64);
+        };
+        if ((dots & 0x01u) != 0u) dot(x1, y1);
+        if ((dots & 0x02u) != 0u) dot(x1, y2);
+        if ((dots & 0x04u) != 0u) dot(x1, y3);
+        if ((dots & 0x40u) != 0u) dot(x1, y4);
+        if ((dots & 0x08u) != 0u) dot(x2, y1);
+        if ((dots & 0x10u) != 0u) dot(x2, y2);
+        if ((dots & 0x20u) != 0u) dot(x2, y3);
+        if ((dots & 0x80u) != 0u) dot(x2, y4);
+        return true;
+    }
+    switch (cp) {
+      case 0x2500:
+      case 0x2501:
+        draw_horizontal(mid_y);
+        return true;
+      case 0x2502:
+      case 0x2503:
+        draw_vertical(mid_x);
+        return true;
+      case 0x250c:
+      case 0x250d:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x2510:
+      case 0x2511:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x2514:
+      case 0x2515:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x2518:
+      case 0x2519:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x251c:
+      case 0x251d:
+      case 0x2523:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x2524:
+      case 0x2525:
+      case 0x252b:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x252c:
+      case 0x252d:
+      case 0x2533:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x2534:
+      case 0x2535:
+      case 0x253b:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x253c:
+      case 0x253d:
+      case 0x254b:
+        draw_horizontal(mid_y);
+        draw_vertical(mid_x);
+        return true;
+      case 0x2580:
+        draw_half(true, false);
+        return true;
+      case 0x2584:
+        draw_half(false, false);
+        return true;
+      case 0x2588:
+        draw_box();
+        return true;
+      case 0x258c:
+        draw_half(true, true);
+        draw_half(false, true);
+        return true;
+      case 0x2590:
+        draw_half(true, false);
+        draw_half(false, false);
+        return true;
+      case 0x2591:
+      case 0x2592:
+      case 0x2593:
+        XSetForeground(display_, gc_, pixel);
+        for (int yy = inner_top; yy <= inner_bottom; yy += 2) {
+          for (int xx = inner_left; xx <= inner_right; xx += (yy % 4 == 0 ? 2 : 3)) {
+            XDrawPoint(display_, backing_, gc_, xx, yy);
+          }
+        }
+        return true;
+      case 0x25a0:
+      case 0x25ae:
+        draw_box();
+        return true;
+      case 0x25b2:
+      case 0x25bc:
+      case 0x25c6:
+      case 0x25cf:
+      case 0x25cb:
+        draw_box();
+        return true;
+      case 0x00b0:
+      case 0x00b1:
+      case 0x2424:
+      case 0x00b6:
+        return false;
+      default:
+        break;
+    }
+    return false;
   }
 
   Display* display_ = nullptr;
@@ -2667,6 +3885,11 @@ private:
   GC gc_ = 0;
   Pixmap backing_ = 0;
   XFontStruct* font_ = nullptr;
+  XFontSet fontset_ = nullptr;
+  XftDraw* xft_draw_ = nullptr;
+  XftFont* xft_font_ = nullptr;
+  mutable std::unordered_map<unsigned long, CachedColor> color_cache_;
+  mutable std::unordered_map<unsigned long, XftColor> xft_color_cache_;
   Atom wm_delete_window_ = 0;
   Atom wm_protocols_ = 0;
   Atom clipboard_atom_ = None;
@@ -2686,7 +3909,9 @@ private:
   unsigned int ascent_ = 12;
   unsigned int descent_ = 4;
   unsigned long palette_[16]{};
+  std::array<unsigned long, 16> default_palette_{};
   unsigned long color_table_[256]{};
+  std::array<unsigned long, 256> default_color_table_{};
   unsigned long background_pixel_ = 0;
   unsigned long foreground_pixel_ = 0;
   unsigned long cursor_pixel_ = 0;
@@ -2713,27 +3938,45 @@ private:
   int cursor_y_ = 0;
   ParseState state_ = ParseState::Ground;
   std::vector<int> csi_params_;
+  std::string csi_raw_;
   int csi_current_ = 0;
   bool csi_have_value_ = false;
   bool csi_private_ = false;
+  bool csi_secondary_ = false;
+  bool csi_pop_ = false;
+  bool csi_equals_ = false;
   unsigned long current_fg_pixel_ = 0;
   unsigned long current_bg_pixel_ = 0;
   bool current_bold_ = false;
   bool current_inverse_ = false;
+  bool current_underline_ = false;
   int saved_x_ = 0;
   int saved_y_ = 0;
   unsigned long saved_fg_pixel_ = 0;
   unsigned long saved_bg_pixel_ = 0;
   bool saved_bold_ = false;
   bool saved_inverse_ = false;
+  bool saved_underline_ = false;
   bool has_saved_ = false;
   bool bracketed_paste_mode_ = false;
   bool mouse_reporting_ = false;
   bool mouse_motion_reporting_ = false;
   bool mouse_sgr_mode_ = false;
+  bool application_cursor_keys_ = false;
+  bool application_keypad_mode_ = false;
+  bool cursor_hidden_by_app_ = false;
+  bool origin_mode_ = false;
   bool g0_special_graphics_ = false;
   bool g1_special_graphics_ = false;
   bool use_g1_charset_ = false;
+  int scroll_region_top_ = 0;
+  int scroll_region_bottom_ = 0;
+  bool current_hyperlink_active_ = false;
+  std::string current_hyperlink_uri_;
+  unsigned int keyboard_flags_ = 0;
+  std::vector<unsigned int> keyboard_mode_stack_;
+  std::string clipboard_text_;
+  bool clipboard_from_osc_ = false;
   std::string utf8_pending_;
   unsigned int utf8_expected_ = 0;
   std::string osc_buffer_;
@@ -2763,6 +4006,14 @@ private:
     unsigned long current_bg_pixel = 0;
     bool current_bold = false;
     bool current_inverse = false;
+    bool current_underline = false;
+    bool current_hyperlink_active = false;
+    std::string current_hyperlink_uri;
+    unsigned int keyboard_flags = 0;
+    std::vector<unsigned int> keyboard_mode_stack;
+    int scroll_region_top = 0;
+    int scroll_region_bottom = 0;
+    bool origin_mode = false;
     bool g0_special_graphics = false;
     bool g1_special_graphics = false;
     bool use_g1_charset = false;

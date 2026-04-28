@@ -12,6 +12,7 @@ enum class InternalKind {
   Browser,
   Preferences,
   About,
+  Home,
 };
 
 struct Client {

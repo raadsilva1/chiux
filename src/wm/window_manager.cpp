@@ -17,7 +17,11 @@
 #include <cstdio>
 #include <filesystem>
 #include <iomanip>
+#include <pwd.h>
 #include <sys/select.h>
+#include <sys/statvfs.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
 #include <errno.h>
 #include <memory>
 #include <unistd.h>
@@ -64,10 +68,80 @@ std::string wrap_terminal_command(const std::string& terminal, const std::string
   if (terminal_name == "chiux-te") {
     return terminal + " -e '" + command + "'";
   }
+  if (terminal_name == "chiux-te-2") {
+    return terminal + " -e '" + command + "'";
+  }
   if (terminal_name == "terminator") {
     return terminal + " -x sh -lc '" + command + "'";
   }
   return terminal + " -e sh -lc '" + command + "'";
+}
+
+std::string human_bytes(unsigned long long value) {
+  static const char* const units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+  double size = static_cast<double>(value);
+  std::size_t unit = 0;
+  while (size >= 1024.0 && unit + 1 < std::size(units)) {
+    size /= 1024.0;
+    ++unit;
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(unit == 0 ? 0 : 1) << size << ' ' << units[unit];
+  return out.str();
+}
+
+std::string format_duration(long long seconds) {
+  if (seconds < 0) {
+    seconds = 0;
+  }
+  const long long days = seconds / 86400;
+  seconds %= 86400;
+  const long long hours = seconds / 3600;
+  seconds %= 3600;
+  const long long minutes = seconds / 60;
+  seconds %= 60;
+  std::ostringstream out;
+  if (days > 0) {
+    out << days << "d ";
+  }
+  if (hours > 0 || days > 0) {
+    out << hours << "h ";
+  }
+  out << minutes << "m " << seconds << 's';
+  return out.str();
+}
+
+std::string format_time_point(const std::chrono::system_clock::time_point& tp) {
+  const std::time_t raw = std::chrono::system_clock::to_time_t(tp);
+  std::tm tm{};
+  localtime_r(&raw, &tm);
+  char buffer[128] = {};
+  if (std::strftime(buffer, sizeof(buffer), "%a %b %d %Y  %H:%M", &tm) == 0) {
+    return {};
+  }
+  return buffer;
+}
+
+struct DiskSnapshot {
+  std::string label;
+  std::string path;
+  std::string summary;
+};
+
+DiskSnapshot sample_disk(const std::string& label, const std::filesystem::path& path) {
+  DiskSnapshot snapshot{label, path.string(), "unavailable"};
+  struct statvfs stats {};
+  if (statvfs(path.c_str(), &stats) != 0) {
+    return snapshot;
+  }
+  const unsigned long long total = static_cast<unsigned long long>(stats.f_blocks) * static_cast<unsigned long long>(stats.f_frsize);
+  const unsigned long long free = static_cast<unsigned long long>(stats.f_bfree) * static_cast<unsigned long long>(stats.f_frsize);
+  const unsigned long long used = total > free ? total - free : 0;
+  const double percent = total > 0 ? (static_cast<double>(used) * 100.0 / static_cast<double>(total)) : 0.0;
+  std::ostringstream out;
+  out << human_bytes(used) << " used / " << human_bytes(total) << " total (" << std::fixed << std::setprecision(0) << percent << "%)";
+  snapshot.summary = out.str();
+  return snapshot;
 }
 
 std::string shorten_label(const std::string& text, std::size_t max_chars) {
@@ -93,7 +167,7 @@ std::string normalize_menu_key(std::string text) {
 
 bool is_generic_launcher_label(const std::string& label) {
   const std::string key = normalize_menu_key(label);
-  return key == "terminal" || key == "newterminal" || key == "filebrowser" || key == "filemanager" || key == "files" || key == "config" || key == "openconfig";
+  return key == "terminal" || key == "modernterminal" || key == "newterminal" || key == "filebrowser" || key == "filemanager" || key == "files" || key == "config" || key == "openconfig";
 }
 
 XFontStruct* load_about_title_font(Display* display) {
@@ -185,6 +259,22 @@ std::filesystem::path executable_directory() {
     }
   }
   return std::filesystem::current_path();
+}
+
+std::string resolve_modern_terminal_command() {
+  const std::filesystem::path exe_dir = executable_directory();
+  const std::vector<std::filesystem::path> candidates = {
+      exe_dir / "chiux-te-2",
+      exe_dir / "../bin/chiux-te-2",
+      "/usr/local/bin/chiux-te-2",
+      "/usr/bin/chiux-te-2",
+  };
+  for (const auto& candidate : candidates) {
+    if (::access(candidate.c_str(), X_OK) == 0) {
+      return std::filesystem::weakly_canonical(candidate).string();
+    }
+  }
+  return "chiux-te-2";
 }
 
 std::optional<std::filesystem::path> locate_resource_path(const std::filesystem::path& relative) {
@@ -711,6 +801,11 @@ void WindowManager::init_desktop() {
 }
 
 void WindowManager::init_keybindings() {
+  refresh_keybindings();
+}
+
+void WindowManager::refresh_keybindings() {
+  XUngrabKey(display_, AnyKey, AnyModifier, root_);
   const KeyCode left = XKeysymToKeycode(display_, XK_Left);
   const KeyCode right = XKeysymToKeycode(display_, XK_Right);
   const std::array<unsigned int, 4> modifiers{
@@ -723,6 +818,7 @@ void WindowManager::init_keybindings() {
     XGrabKey(display_, left, modifier, root_, True, GrabModeAsync, GrabModeAsync);
     XGrabKey(display_, right, modifier, root_, True, GrabModeAsync, GrabModeAsync);
   }
+  XSync(display_, False);
 }
 
 void WindowManager::open_execute_window() {
@@ -923,6 +1019,38 @@ void WindowManager::open_about_window() {
   }
 }
 
+void WindowManager::open_home_window() {
+  if (home_window_ != 0) {
+    if (Client* client = find_client(home_window_)) {
+      if (client->iconic) {
+        deiconify_client(*client);
+      }
+      focus_client(client);
+      draw_internal_content(*client);
+      return;
+    }
+    home_window_ = 0;
+  }
+
+  const unsigned int width = 720;
+  const unsigned int height = 440;
+  const int x = std::max(0, (DisplayWidth(display_, screen_) - static_cast<int>(width)) / 2);
+  const int y = std::max(24, (DisplayHeight(display_, screen_) - static_cast<int>(height)) / 2);
+  home_window_ = XCreateSimpleWindow(display_, root_, x, y, width, height, 0, theme_.frame_active_pixel, theme_.menu_pixel);
+  XStoreName(display_, home_window_, "Home");
+  manage_window(home_window_);
+  if (Client* client = find_client(home_window_)) {
+    client->internal_kind = InternalKind::Home;
+    XMapWindow(display_, client->shadow);
+    XMapWindow(display_, client->frame);
+    XMapWindow(display_, client->window);
+    std::array<Window, 2> restack{client->frame, client->shadow};
+    XRestackWindows(display_, restack.data(), 2);
+    focus_client(client);
+    draw_internal_content(*client);
+  }
+}
+
 void WindowManager::run_launcher_command(const std::string& command) {
   if (command.rfind("chiux:", 0) == 0) {
     const std::string action = command.substr(6);
@@ -932,6 +1060,8 @@ void WindowManager::run_launcher_command(const std::string& command) {
       open_execute_window();
     } else if (action == "open-preferences") {
       open_preferences_window();
+    } else if (action == "open-home-info") {
+      open_home_window();
     } else {
       handle_menu_action(action);
     }
@@ -979,6 +1109,8 @@ void WindowManager::draw_internal_content(Client& client) {
     draw_preferences_window(client);
   } else if (client.internal_kind == InternalKind::About) {
     draw_about_window(client);
+  } else if (client.internal_kind == InternalKind::Home) {
+    draw_home_window(client);
   }
   if (client.content_backing) {
     GC gc = XCreateGC(display_, client.window, 0, nullptr);
@@ -1271,7 +1403,7 @@ void WindowManager::draw_about_window(Client& client) {
     const int icon_x = icon_box_x + std::max(0, (static_cast<int>(icon_box_w) - static_cast<int>(target_w)) / 2);
     const int icon_y = icon_box_y + std::max(0, (static_cast<int>(icon_box_h) - static_cast<int>(target_h)) / 2);
     Visual* visual = DefaultVisual(display_, screen_);
-    XImage* image = XCreateImage(display_, visual, DefaultDepth(display_, screen_), ZPixmap, 0, nullptr,
+    XImage* image = XCreateImage(display_, visual, static_cast<unsigned int>(DefaultDepth(display_, screen_)), ZPixmap, 0, nullptr,
                                  target_w, target_h, 32, 0);
     if (image) {
       image->data = static_cast<char*>(std::malloc(static_cast<std::size_t>(image->bytes_per_line) * target_h));
@@ -1311,6 +1443,152 @@ void WindowManager::draw_about_window(Client& client) {
     const int y = summary_text_y + static_cast<int>(i) * body_line_height;
     XDrawString(display_, target, gc, text_box_x, y, lines[i].c_str(), static_cast<int>(lines[i].size()));
   }
+  XFreeGC(display_, gc);
+}
+
+void WindowManager::draw_home_window(Client& client) {
+  Drawable target = client.content_backing ? client.content_backing : client.window;
+  const unsigned int draw_width = client.content_backing ? client.content_width : client.width;
+  const unsigned int draw_height = client.content_backing ? client.content_height : client.height;
+  GC gc = XCreateGC(display_, target, 0, nullptr);
+  XSetForeground(display_, gc, theme_.menu_pixel);
+  XFillRectangle(display_, target, gc, 0, 0, draw_width, draw_height);
+
+  XSetForeground(display_, gc, theme_.shadow_pixel);
+  XDrawLine(display_, target, gc, 1, static_cast<int>(draw_height) - 2, static_cast<int>(draw_width) - 2, static_cast<int>(draw_height) - 2);
+  XDrawLine(display_, target, gc, static_cast<int>(draw_width) - 2, 1, static_cast<int>(draw_width) - 2, static_cast<int>(draw_height) - 2);
+  XSetForeground(display_, gc, theme_.frame_active_pixel);
+  XDrawRectangle(display_, target, gc, 0, 0, draw_width - 1, draw_height - 1);
+
+  const std::string title = "Home";
+  const std::string subtitle = "System overview";
+  XFontStruct* title_font = load_about_title_font(display_);
+  XFontStruct* body_font = load_about_body_font(display_);
+  if (title_font) {
+    XSetFont(display_, gc, title_font->fid);
+  }
+  const int title_y = 36;
+  const int title_x = std::max(0, static_cast<int>(draw_width / 2) - text_width(title_font, title) / 2);
+  XSetForeground(display_, gc, theme_.menu_text_pixel);
+  XDrawString(display_, target, gc, title_x, title_y, title.c_str(), static_cast<int>(title.size()));
+
+  if (body_font) {
+    XSetFont(display_, gc, body_font->fid);
+  }
+  const int body_line_height = body_font ? (body_font->ascent + body_font->descent + 4) : 16;
+  const int subtitle_y = 58;
+  const int subtitle_x = std::max(0, static_cast<int>(draw_width / 2) - text_width(body_font, subtitle) / 2);
+  XDrawString(display_, target, gc, subtitle_x, subtitle_y, subtitle.c_str(), static_cast<int>(subtitle.size()));
+
+  char host_buffer[256] = {};
+  if (gethostname(host_buffer, sizeof(host_buffer) - 1) != 0) {
+    std::snprintf(host_buffer, sizeof(host_buffer), "localhost");
+  }
+  const std::string host = host_buffer;
+
+  std::string user = "unknown";
+  if (const passwd* pw = getpwuid(getuid()); pw && pw->pw_name) {
+    user = pw->pw_name;
+  }
+
+  struct utsname uname_info {};
+  std::string kernel = "unknown";
+  if (uname(&uname_info) == 0) {
+    kernel = std::string(uname_info.sysname) + " " + uname_info.release + " " + uname_info.machine;
+  }
+
+  std::string uptime = "unavailable";
+  struct sysinfo info {};
+  if (sysinfo(&info) == 0) {
+    uptime = format_duration(static_cast<long long>(info.uptime));
+  }
+
+  const auto now_text = format_time_point(std::chrono::system_clock::now());
+  const std::string home_path = home_directory().string();
+  const DiskSnapshot root_disk = sample_disk("Root", "/");
+  const DiskSnapshot home_disk = sample_disk("Home", home_directory());
+
+  const int panel_top = 84;
+  const int panel_bottom = static_cast<int>(draw_height) - 24;
+  const int panel_height = std::max(1, panel_bottom - panel_top);
+  const int left_x = 24;
+  const int left_w = 208;
+  const int right_x = left_x + left_w + 20;
+  const int right_w = std::max(1, static_cast<int>(draw_width) - right_x - 24);
+  const int left_inner = left_w - 2;
+  const int right_inner = right_w - 2;
+
+  auto draw_panel = [&](int x, int y, int w, int h) {
+    XSetForeground(display_, gc, theme_.frame_active_pixel);
+    XDrawRectangle(display_, target, gc, x, y, static_cast<unsigned int>(w), static_cast<unsigned int>(h));
+    XSetForeground(display_, gc, theme_.menu_pixel);
+    XFillRectangle(display_, target, gc, x + 1, y + 1, static_cast<unsigned int>(std::max(1, w - 1)), static_cast<unsigned int>(std::max(1, h - 1)));
+  };
+
+  draw_panel(left_x, panel_top, left_inner, panel_height);
+  draw_panel(right_x, panel_top, right_inner, panel_height);
+
+  const int house_x = left_x + 34;
+  const int house_y = panel_top + 28;
+  const int house_w = 136;
+  XSetForeground(display_, gc, theme_.shadow_pixel);
+  XDrawLine(display_, target, gc, house_x + 18, house_y + 4, house_x + house_w / 2, house_y - 18);
+  XDrawLine(display_, target, gc, house_x + house_w / 2, house_y - 18, house_x + house_w - 18, house_y + 4);
+  XSetForeground(display_, gc, theme_.frame_active_pixel);
+  XDrawLine(display_, target, gc, house_x + 12, house_y + 6, house_x + house_w / 2, house_y - 12);
+  XDrawLine(display_, target, gc, house_x + house_w / 2, house_y - 12, house_x + house_w - 12, house_y + 6);
+  XFillRectangle(display_, target, gc, house_x + 30, house_y + 20, 76, 56);
+  XSetForeground(display_, gc, theme_.menu_pixel);
+  XFillRectangle(display_, target, gc, house_x + 33, house_y + 23, 70, 50);
+  XSetForeground(display_, gc, theme_.frame_active_pixel);
+  XDrawRectangle(display_, target, gc, house_x + 30, house_y + 20, 76, 56);
+  XFillRectangle(display_, target, gc, house_x + 61, house_y + 44, 12, 32);
+  XDrawRectangle(display_, target, gc, house_x + 61, house_y + 44, 12, 32);
+  XDrawLine(display_, target, gc, house_x + 28, house_y + 76, house_x + 108, house_y + 76);
+  XDrawLine(display_, target, gc, house_x + 28, house_y + 76, house_x + 20, house_y + 82);
+  XDrawLine(display_, target, gc, house_x + 108, house_y + 76, house_x + 116, house_y + 82);
+  XDrawLine(display_, target, gc, house_x + 20, house_y + 82, house_x + 116, house_y + 82);
+
+  if (body_font) {
+    XSetFont(display_, gc, body_font->fid);
+  }
+  const std::string identity = user + "@" + host;
+  const int identity_x = left_x + std::max(0, (left_inner - text_width(body_font, identity)) / 2);
+  const int identity_y = panel_top + 162;
+  XSetForeground(display_, gc, theme_.menu_text_pixel);
+  XDrawString(display_, target, gc, identity_x, identity_y, identity.c_str(), static_cast<int>(identity.size()));
+  const int home_path_y = identity_y + body_line_height;
+  const int home_path_x = left_x + 12;
+  std::string home_path_line = home_path;
+  if (home_path_line.size() > 24) {
+    home_path_line = "..." + home_path_line.substr(home_path_line.size() - 21);
+  }
+  XDrawString(display_, target, gc, home_path_x, home_path_y, home_path_line.c_str(), static_cast<int>(home_path_line.size()));
+
+  const int section_x = right_x + 18;
+  int section_y = panel_top + 28;
+  const auto draw_label_value = [&](const std::string& label, const std::string& value) {
+    XSetForeground(display_, gc, theme_.frame_active_pixel);
+    XDrawString(display_, target, gc, section_x, section_y, label.c_str(), static_cast<int>(label.size()));
+    section_y += body_line_height;
+    XSetForeground(display_, gc, theme_.menu_text_pixel);
+    XDrawString(display_, target, gc, section_x + 18, section_y, value.c_str(), static_cast<int>(value.size()));
+    section_y += body_line_height + 4;
+  };
+
+  draw_label_value("User", identity);
+  draw_label_value("Date", now_text);
+  draw_label_value("Kernel", kernel);
+  draw_label_value("Uptime", uptime);
+  draw_label_value("Disk /", root_disk.summary);
+  draw_label_value("Disk Home", home_disk.summary);
+
+  XSetForeground(display_, gc, theme_.shadow_pixel);
+  XDrawLine(display_, target, gc, section_x, panel_top + panel_height - 40, right_x + right_inner - 20, panel_top + panel_height - 40);
+  XSetForeground(display_, gc, theme_.frame_active_pixel);
+  const std::string footer = "chiux integrated system view";
+  XDrawString(display_, target, gc, section_x, panel_top + panel_height - 18, footer.c_str(), static_cast<int>(footer.size()));
+
   XFreeGC(display_, gc);
 }
 
@@ -1500,6 +1778,11 @@ void WindowManager::handle_internal_key_press(Client& client, const XKeyEvent& e
     if (sym == XK_Escape) {
       XDestroyWindow(display_, client.frame);
     }
+  } else if (client.internal_kind == InternalKind::Home) {
+    const KeySym sym = XLookupKeysym(const_cast<XKeyEvent*>(&event), 0);
+    if (sym == XK_Escape) {
+      XDestroyWindow(display_, client.frame);
+    }
   }
 }
 
@@ -1652,6 +1935,8 @@ void WindowManager::manage_window(Window window) {
     stored.internal_kind = InternalKind::Preferences;
   } else if (window == about_window_) {
     stored.internal_kind = InternalKind::About;
+  } else if (window == home_window_) {
+    stored.internal_kind = InternalKind::Home;
   }
   if (stored.internal_kind != InternalKind::Unset) {
     XSelectInput(display_, window, PropertyChangeMask | StructureNotifyMask | FocusChangeMask | EnterWindowMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | ExposureMask);
@@ -1700,6 +1985,11 @@ void WindowManager::unmanage_window(Window window, bool withdraw) {
     if (menubar_) {
       menubar_->set_application_title("chiux");
     }
+    if (desktop_) {
+      XSetInputFocus(display_, desktop_->window(), RevertToPointerRoot, CurrentTime);
+    } else {
+      XSetInputFocus(display_, root_, RevertToPointerRoot, CurrentTime);
+    }
   }
   if (client.window == execute_window_) {
     execute_window_ = 0;
@@ -1716,12 +2006,16 @@ void WindowManager::unmanage_window(Window window, bool withdraw) {
   if (client.window == about_window_) {
     about_window_ = 0;
   }
+  if (client.window == home_window_) {
+    home_window_ = 0;
+  }
   const auto order_it = std::find(stacking_order_.begin(), stacking_order_.end(), client.window);
   if (order_it != stacking_order_.end()) {
     stacking_order_.erase(order_it);
   }
   clients_.erase(it);
   update_client_list();
+  refresh_keybindings();
   restack_managed_windows();
 }
 
@@ -1900,8 +2194,8 @@ void WindowManager::draw_frame(Client& client) {
     XFillRectangle(display_, client.frame, gc, 0, 0, frame_width - 2, frame_height - 2);
     XSetForeground(display_, gc, theme_.frame_active_pixel);
     XDrawRectangle(display_, client.frame, gc, 0, 0, frame_width - 1, frame_height - 1);
-    XDrawLine(display_, client.frame, gc, 1, 1, frame_width - 2, 1);
-    XDrawLine(display_, client.frame, gc, 1, 1, 1, frame_height - 2);
+    XDrawLine(display_, client.frame, gc, 1, 1, static_cast<int>(frame_width) - 2, 1);
+    XDrawLine(display_, client.frame, gc, 1, 1, 1, static_cast<int>(frame_height) - 2);
     XSetForeground(display_, gc, theme_.menu_pixel);
     XFillRectangle(display_, client.frame, gc, 10, 13, 18, 12);
     XSetForeground(display_, gc, theme_.frame_active_pixel);
@@ -2035,6 +2329,16 @@ void WindowManager::update_client_list() {
 void WindowManager::save_config() {
   if (!desktop_) {
     return;
+  }
+  try {
+    const auto on_disk = config::Config::load_or_default(config_path_);
+    config_.resolve_terminal_binary = on_disk.resolve_terminal_binary;
+    config_.terminal_command = on_disk.terminal_command;
+    config_.terminal_feel = on_disk.terminal_feel;
+    config_.file_browser_command = on_disk.file_browser_command;
+    config_.launchers = on_disk.launchers;
+  } catch (const std::exception& ex) {
+    chiux::log::warn(std::string("failed to refresh chiux config before save: ") + ex.what());
   }
   std::vector<config::DesktopIcon> icons;
   icons.reserve(desktop_->icons().size());
@@ -2223,6 +2527,7 @@ void WindowManager::show_menu(ui::MenuId menu, int x, int y) {
     case ui::MenuId::File:
       items = {
           {"Terminal", "launch-terminal"},
+          {"Modern Terminal", "launch-modern-terminal"},
           {"File Manager", "launch-browser"},
           {"Execute", "open-execute"},
           {"Open Config", "open-config"},
@@ -2299,6 +2604,8 @@ void WindowManager::handle_menu_action(const std::string& action) {
     open_preferences_window();
   } else if (action == "launch-terminal") {
     run_launcher_command(config_.terminal_command);
+  } else if (action == "launch-modern-terminal") {
+    run_launcher_command(resolve_modern_terminal_command());
   } else if (action == "launch-browser") {
     open_file_manager_window();
   } else if (action == "open-file-manager") {
@@ -2506,6 +2813,7 @@ void WindowManager::handle_unmap_notify(const XUnmapEvent& event) {
 
 void WindowManager::handle_destroy_notify(const XDestroyWindowEvent& event) {
   unmanage_window(event.window, false);
+  refresh_keybindings();
 }
 
 void WindowManager::handle_button_press(const XButtonEvent& event) {

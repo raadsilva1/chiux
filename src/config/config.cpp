@@ -54,6 +54,27 @@ void dedupe_preserve_order(std::vector<T>& items, KeyFn key_fn) {
   items = std::move(unique);
 }
 
+template <typename T>
+void move_entry_after_label(std::vector<T>& items, const std::string& label, const std::string& after_label) {
+  const auto entry_it = std::find_if(items.begin(), items.end(), [&](const T& item) {
+    return item.label == label;
+  });
+  const auto after_it = std::find_if(items.begin(), items.end(), [&](const T& item) {
+    return item.label == after_label;
+  });
+  if (entry_it == items.end() || after_it == items.end()) {
+    return;
+  }
+  if (entry_it == after_it + 1) {
+    return;
+  }
+  T entry = *entry_it;
+  const std::size_t target_index = static_cast<std::size_t>(std::distance(items.begin(), after_it)) + 1u;
+  items.erase(entry_it);
+  const std::size_t insert_index = std::min(target_index, items.size());
+  items.insert(items.begin() + static_cast<std::ptrdiff_t>(insert_index), std::move(entry));
+}
+
 std::string find_in_path(const char* name) {
   const char* path = std::getenv("PATH");
   if (!path || !*path) {
@@ -201,6 +222,25 @@ std::string resolve_primary_terminal() {
   return "terminator";
 }
 
+std::string resolve_modern_terminal() {
+  if (const std::string resolved = resolve_executable("chiux-te-2"); !resolved.empty() && resolved != "chiux-te-2") {
+    return resolved;
+  }
+  return "chiux-te-2";
+}
+
+bool has_launcher_entry(const std::vector<Launcher>& launchers, const std::string& label) {
+  return std::any_of(launchers.begin(), launchers.end(), [&](const Launcher& launcher) {
+    return launcher.label == label;
+  });
+}
+
+bool has_icon_entry(const std::vector<DesktopIcon>& icons, const std::string& label) {
+  return std::any_of(icons.begin(), icons.end(), [&](const DesktopIcon& icon) {
+    return icon.label == label;
+  });
+}
+
 unsigned long parse_color(const std::string& value, unsigned long fallback) {
   if (value.empty()) {
     return fallback;
@@ -289,18 +329,37 @@ bool is_legacy_terminal_name(const std::string& command) {
   return base == "terminator" || base == "xterm";
 }
 
+bool is_home_icon_command(const std::string& label, const std::string& command) {
+  std::string normalized_label;
+  normalized_label.reserve(label.size());
+  for (char ch : label) {
+    if (std::isalnum(static_cast<unsigned char>(ch)) != 0) {
+      normalized_label.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+  }
+  if (normalized_label != "home") {
+    return false;
+  }
+  return command.find("xdg-open") != std::string::npos &&
+         (command.find("$HOME") != std::string::npos || command.find('~') != std::string::npos);
+}
+
 Config defaults() {
   Config config;
   config.terminal_command = resolve_primary_terminal();
+  config.terminal_feel = 0;
+  const std::string modern_terminal_command = resolve_modern_terminal();
   config.launchers = {
       {"Terminal", config.terminal_command},
+      {"Modern Terminal", modern_terminal_command},
       {"Files", config.file_browser_command},
       {"Config", config.terminal_command + " -x sh -lc 'exec ${EDITOR:-vi} \"$HOME/.config/chiux/config.ini\"'"},
   };
   config.desktop_icons = {
       {"Terminal", config.terminal_command, 0, 0},
+      {"Modern Terminal", modern_terminal_command, 0, 0},
       {"Files", config.file_browser_command, 0, 0},
-      {"Home", "xdg-open \"$HOME\"", 0, 0},
+      {"Home", "chiux:open-home-info", 0, 0},
       {"Trash", "xdg-open \"$HOME/.local/share/Trash\"", 0, 0},
   };
   return config;
@@ -333,6 +392,7 @@ Config Config::load_or_default(const std::filesystem::path& path) {
   bool background_color_specified = false;
   bool resolve_terminal_binary_specified = false;
   bool terminal_command_specified = false;
+  bool terminal_feel_specified = false;
 
   std::string line;
   while (std::getline(input, line)) {
@@ -379,6 +439,12 @@ Config Config::load_or_default(const std::filesystem::path& path) {
     } else if (key == "terminal_command") {
       config.terminal_command = value;
       terminal_command_specified = true;
+    } else if (key == "terminal_feel") {
+      config.terminal_feel = parse_uint(value, config.terminal_feel);
+      if (config.terminal_feel >= kTerminalFeelThemeCount) {
+        config.terminal_feel = 0;
+      }
+      terminal_feel_specified = true;
     } else if (key == "file_browser_command") {
       config.file_browser_command = value;
     } else if (key == "launcher") {
@@ -407,10 +473,20 @@ Config Config::load_or_default(const std::filesystem::path& path) {
   if (!resolve_terminal_binary_specified) {
     config.resolve_terminal_binary = defaults().resolve_terminal_binary;
   }
+  if (!terminal_feel_specified) {
+    config.terminal_feel = 0;
+  }
   for (auto& launcher : config.launchers) {
     if (launcher.command == "xterm" || launcher.command == "terminator") {
       launcher.command = config.terminal_command;
       config.needs_save = true;
+    }
+    if (launcher.label == "Modern Terminal") {
+      const std::string modern_terminal = resolve_modern_terminal();
+      if (!modern_terminal.empty() && launcher.command != modern_terminal) {
+        launcher.command = modern_terminal;
+        config.needs_save = true;
+      }
     }
   }
   for (auto& icon : config.desktop_icons) {
@@ -418,17 +494,48 @@ Config Config::load_or_default(const std::filesystem::path& path) {
       icon.command = config.terminal_command;
       config.needs_save = true;
     }
+    if (is_home_icon_command(icon.label, icon.command)) {
+      icon.command = "chiux:open-home-info";
+      config.needs_save = true;
+    }
     if (icon.command == "xdg-open ~") {
       icon.command = config.file_browser_command;
       config.needs_save = true;
+    }
+    if (icon.label == "Modern Terminal") {
+      const std::string modern_terminal = resolve_modern_terminal();
+      if (!modern_terminal.empty() && icon.command != modern_terminal) {
+        icon.command = modern_terminal;
+        config.needs_save = true;
+      }
     }
   }
 
   if (config.launchers.empty()) {
     config.launchers = defaults().launchers;
+  } else if (!has_launcher_entry(config.launchers, "Modern Terminal")) {
+    const auto terminal_it = std::find_if(config.launchers.begin(), config.launchers.end(), [](const Launcher& launcher) {
+      return launcher.label == "Terminal";
+    });
+    if (terminal_it != config.launchers.end()) {
+      config.launchers.insert(terminal_it + 1, {"Modern Terminal", resolve_modern_terminal()});
+    } else {
+      config.launchers.push_back({"Modern Terminal", resolve_modern_terminal()});
+    }
+    config.needs_save = true;
   }
   if (config.desktop_icons.empty()) {
     config.desktop_icons = defaults().desktop_icons;
+  } else if (!has_icon_entry(config.desktop_icons, "Modern Terminal")) {
+    const auto terminal_it = std::find_if(config.desktop_icons.begin(), config.desktop_icons.end(), [](const DesktopIcon& icon) {
+      return icon.label == "Terminal";
+    });
+    if (terminal_it != config.desktop_icons.end()) {
+      config.desktop_icons.insert(terminal_it + 1, {"Modern Terminal", resolve_modern_terminal(), 0, 0});
+    } else {
+      config.desktop_icons.push_back({"Modern Terminal", resolve_modern_terminal(), 0, 0});
+    }
+    config.needs_save = true;
   }
 
   if (!background_color_specified) {
@@ -458,6 +565,12 @@ Config Config::load_or_default(const std::filesystem::path& path) {
           launcher.command = config.terminal_command;
           config.needs_save = true;
         }
+      } else if (launcher.label == "Modern Terminal") {
+        const std::string modern_terminal = resolve_modern_terminal();
+        if (!modern_terminal.empty() && launcher.command != modern_terminal) {
+          launcher.command = modern_terminal;
+          config.needs_save = true;
+        }
       } else {
         const std::string resolved = resolve_executable(launcher.command);
         if (resolved != launcher.command) {
@@ -470,6 +583,12 @@ Config Config::load_or_default(const std::filesystem::path& path) {
       if (is_legacy_terminal_name(icon.command) || icon.command == "chiux-te") {
         if (icon.command != config.terminal_command) {
           icon.command = config.terminal_command;
+          config.needs_save = true;
+        }
+      } else if (icon.label == "Modern Terminal") {
+        const std::string modern_terminal = resolve_modern_terminal();
+        if (!modern_terminal.empty() && icon.command != modern_terminal) {
+          icon.command = modern_terminal;
           config.needs_save = true;
         }
       } else {
@@ -488,6 +607,8 @@ Config Config::load_or_default(const std::filesystem::path& path) {
   dedupe_preserve_order(config.desktop_icons, [](const DesktopIcon& icon) {
     return icon.label + "\x1f" + icon.command;
   });
+  move_entry_after_label(config.launchers, "Modern Terminal", "Terminal");
+  move_entry_after_label(config.desktop_icons, "Modern Terminal", "Terminal");
 
   return config;
 }
@@ -517,6 +638,7 @@ void Config::save(const std::filesystem::path& path) const {
   output << "menu_text_pixel=" << menu_text_pixel << '\n';
   output << "resolve_terminal_binary=" << (resolve_terminal_binary ? 1 : 0) << '\n';
   output << "terminal_command=" << terminal_command << '\n';
+  output << "terminal_feel=" << terminal_feel << '\n';
   output << "file_browser_command=" << file_browser_command << '\n';
   for (const auto& launcher : launchers) {
     output << "launcher=" << launcher.label << '|' << launcher.command << '\n';

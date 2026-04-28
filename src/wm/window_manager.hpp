@@ -41,6 +41,7 @@ private:
   void init_atoms();
   void init_desktop();
   void init_keybindings();
+  void refresh_keybindings();
   void init_theme_from_config();
   void scan_existing_windows();
   void manage_window(Window window);
@@ -58,6 +59,7 @@ private:
   void open_file_manager_window();
   void open_preferences_window();
   void open_about_window();
+  void open_home_window();
   void refresh_file_manager();
   void ensure_file_manager_selection_visible(const Client& client);
   void draw_internal_content(Client& client);
@@ -68,6 +70,7 @@ private:
   void draw_file_manager_window(Client& client);
   void draw_preferences_window(Client& client);
   void draw_about_window(Client& client);
+  void draw_home_window(Client& client);
   bool load_about_icon();
   void handle_internal_button_press(Client& client, const XButtonEvent& event);
   void handle_internal_button_release(Client& client, const XButtonEvent& event);
@@ -159,6 +162,7 @@ private:
   Window file_manager_window_ = 0;
   Window preferences_window_ = 0;
   Window about_window_ = 0;
+  Window home_window_ = 0;
   std::filesystem::path file_manager_path_;
   std::vector<std::filesystem::directory_entry> file_manager_entries_;
   std::size_t file_manager_selected_ = 0;
